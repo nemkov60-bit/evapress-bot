@@ -1,0 +1,110 @@
+import sqlite3
+from datetime import datetime
+
+from config import DB_PATH, TZ
+
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+conn.row_factory = sqlite3.Row
+conn.execute("PRAGMA foreign_keys = ON")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users(
+    tg_id INTEGER PRIMARY KEY,
+    full_name TEXT NOT NULL,
+    username TEXT,
+    phone TEXT,
+    active INTEGER DEFAULT 1,
+    created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS instructions(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    body TEXT,
+    file_id TEXT,
+    file_type TEXT,
+    created_at TEXT,
+    updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS workbooks(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    work_date TEXT UNIQUE NOT NULL,      -- YYYY-MM-DD
+    filename TEXT NOT NULL,
+    path TEXT NOT NULL,
+    uploaded_at TEXT,
+    uploaded_by INTEGER
+);
+CREATE TABLE IF NOT EXISTS routes(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workbook_id INTEGER NOT NULL REFERENCES workbooks(id) ON DELETE CASCADE,
+    route_no TEXT NOT NULL,
+    sheet_name TEXT NOT NULL,
+    tk_col TEXT NOT NULL,
+    comment_col TEXT,
+    driver_id INTEGER,
+    assigned_at TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    UNIQUE(workbook_id, sheet_name)
+);
+CREATE TABLE IF NOT EXISTS points(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    route_id INTEGER NOT NULL REFERENCES routes(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    row_idx INTEGER NOT NULL,
+    point_no TEXT, network TEXT, code_1c TEXT, address TEXT,
+    qty TEXT, price TEXT, orig_comment TEXT,
+    status TEXT DEFAULT 'open',          -- open / closed
+    opened_at TEXT, closed_at TEXT, closed_by INTEGER,
+    photo_display TEXT,                  -- фото выкладки
+    photo_invoice TEXT,                  -- фото накладной
+    photo_poa TEXT,                      -- фото доверенности на возврат
+    poa_absent INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS problems(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    point_id INTEGER, route_id INTEGER, driver_id INTEGER,
+    text TEXT, file_id TEXT, file_type TEXT,
+    created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS admin_messages(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    admin_id INTEGER, target TEXT, text TEXT, created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_points_route ON points(route_id);
+CREATE INDEX IF NOT EXISTS ix_routes_driver ON routes(driver_id);
+"""
+conn.executescript(SCHEMA)
+conn.commit()
+
+
+def now() -> datetime:
+    return datetime.now(TZ)
+
+
+def now_s() -> str:
+    return now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def q(sql: str, params=()) -> list[sqlite3.Row]:
+    return conn.execute(sql, params).fetchall()
+
+
+def q1(sql: str, params=()) -> sqlite3.Row | None:
+    return conn.execute(sql, params).fetchone()
+
+
+def x(sql: str, params=()) -> int:
+    cur = conn.execute(sql, params)
+    conn.commit()
+    return cur.lastrowid
+
+
+def get_setting(key: str, default: str = "") -> str:
+    r = q1("SELECT value FROM settings WHERE key=?", (key,))
+    return r["value"] if r else default
+
+
+def set_setting(key: str, value: str) -> None:
+    x("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+      (key, value))
