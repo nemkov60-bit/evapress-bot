@@ -31,6 +31,14 @@ WRITE_PROBLEMS_TO_COMMENTS = os.getenv("WRITE_PROBLEMS_TO_COMMENTS", "1") == "1"
 DRIVER_ROUTE_DAYS = int(os.getenv("DRIVER_ROUTE_DAYS", "2"))
 # Время ежедневной резервной копии (ЧЧ:ММ, часовой пояс TZ_NAME). Пусто — не присылать.
 BACKUP_TIME = os.getenv("BACKUP_TIME", "23:30").strip()
+# Чат для автокопии (закреплённое сообщение, обновляется после изменений данных). По умолчанию — личный чат
+# с первым администратором из ADMIN_IDS. Можно указать ID отдельного приватного канала, где бот — администратор.
+_bc = os.getenv("BACKUP_CHAT_ID", "").strip()
+BACKUP_CHAT_ID = int(_bc) if _bc.lstrip("-").isdigit() else (
+    int(re.split(r"[,\s;]+", os.getenv("ADMIN_IDS", "").strip())[0])
+    if os.getenv("ADMIN_IDS", "").strip()[:1].isdigit() else None)
+# Как часто (минут) обновлять автокопию, если данные менялись
+AUTOSAVE_MINUTES = int(os.getenv("AUTOSAVE_MINUTES", "5"))
 
 for d in (DATA_DIR, WB_DIR, EXPORT_DIR):
     d.mkdir(parents=True, exist_ok=True)

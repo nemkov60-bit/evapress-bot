@@ -55,8 +55,9 @@ def admin_ids() -> set[int]:
 
 
 async def notify_admins(bot: Bot, text: str, reply_markup: InlineKeyboardMarkup | None = None,
-                        file_id: str | None = None, file_type: str | None = None) -> None:
-    for aid in admin_ids():
+                        file_id: str | None = None, file_type: str | None = None,
+                        exclude: set[int] | None = None) -> None:
+    for aid in admin_ids() - (exclude or set()):
         try:
             await send_content(bot, aid, text, file_id, file_type, reply_markup)
         except Exception:  # админ не запускал бота и т.п.

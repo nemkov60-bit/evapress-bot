@@ -223,8 +223,19 @@ async def reg_name(message: Message, state: FSMContext, bot: Bot):
     }[role]
     await message.answer(f"✅ Вы зарегистрированы как <b>{h(name)}</b> ({ROLE_NAMES[role]}).\n{hint}",
                          reply_markup=kb_for(role))
-    await notify_admins(bot, f"🆕 По приглашению зарегистрирован(а) {ROLE_NAMES[role].lower()}: "
-                             f"{user_label(message.from_user.id)}")
+    uid = message.from_user.id
+    inviter = inv["created_by"]
+    rows = [[("👤 Карточка пользователя", f"u:{uid}")]]
+    if role == "driver":
+        wb = S.latest_workbook()
+        if wb and not wb["closed_at"]:
+            rows.insert(0, [(f"🧭 Назначить маршрут на {S.fmt_date(wb['work_date'])}", f"wd:as:{wb['id']}")])
+    await notify_admins(bot, f"🆕 <b>Новый пользователь по приглашению</b>\n"
+                             f"👤 {user_label(uid)}, ID <code>{uid}</code>\n"
+                             f"Роль: <b>{ROLE_NAMES[role]}</b>\n"
+                             f"Пригласил(а): {user_label(inviter) if inviter else '—'}\n"
+                             f"Зарегистрирован(а): {db.now():%d.%m.%Y %H:%M}",
+                        reply_markup=ikb(rows), exclude={uid})
 
 
 # ------------------------------------------------------------ guards ------

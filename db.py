@@ -176,16 +176,25 @@ def q1(sql: str, params=()) -> sqlite3.Row | None:
     return conn.execute(sql, params).fetchone()
 
 
+# True, если данные менялись после последней автокопии (см. backup.py)
+dirty = False
+
+
 def x(sql: str, params=()) -> int:
+    global dirty
     cur = conn.execute(sql, params)
     conn.commit()
+    dirty = True
     return cur.lastrowid
 
 
 def xc(sql: str, params=()) -> int:
     """execute + commit, возвращает число изменённых строк"""
+    global dirty
     cur = conn.execute(sql, params)
     conn.commit()
+    if cur.rowcount:
+        dirty = True
     return cur.rowcount
 
 

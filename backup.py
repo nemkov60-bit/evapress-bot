@@ -150,3 +150,103 @@ def restore(zip_path: Path) -> Path:
     for w in db.q("SELECT id, path FROM workbooks"):
         db.x("UPDATE workbooks SET path=? WHERE id=?", (str(WB_DIR / Path(w["path"]).name), w["id"]))
     return safety
+
+
+# ------------------------------------------------------------------ автокопия ---
+# Одна закреплённая копия в BACKUP_CHAT_ID, которая обновляется после изменений данных.
+# Если хостинг стёр базу при пересборке, бот при запуске сам находит закреплённую копию и восстанавливается.
+
+from aiogram.types import InputMediaDocument  # noqa: E402
+
+from config import AUTOSAVE_MINUTES, BACKUP_CHAT_ID  # noqa: E402
+
+AUTO_CAPTION = ("💾 <b>Автокопия данных бота</b> — обновляется автоматически.\n"
+                "Не удаляйте и не открепляйте это сообщение: по нему бот восстановит данные, "
+                "если хостинг их потеряет.\n")
+_auto = {"msg_id": None, "day": None}
+_lock = asyncio.Lock()
+
+
+def _caption(meta: dict) -> str:
+    return AUTO_CAPTION + f"Обновлено: {meta['created_at'][:16]}\n" + \
+        ", ".join(f"{k}: {v}" for k, v in meta["counts"].items())
+
+
+async def find_pinned(bot: Bot):
+    if not BACKUP_CHAT_ID:
+        return None
+    try:
+        chat = await bot.get_chat(BACKUP_CHAT_ID)
+    except Exception as e:  # noqa: BLE001
+        log.warning("get_chat(%s) failed: %s", BACKUP_CHAT_ID, e)
+        return None
+    pm = chat.pinned_message
+    if pm and pm.document and (pm.document.file_name or "").startswith(PREFIX):
+        return pm
+    return None
+
+
+async def autosave(bot: Bot, force: bool = False) -> None:
+    """Обновляет закреплённую автокопию, если данные менялись (или force)."""
+    if not BACKUP_CHAT_ID or (not db.dirty and not force) or is_empty():
+        return
+    async with _lock:
+        db.dirty = False
+        path, meta = make_backup()
+        try:
+            today = db.now().date().isoformat()
+            msg_id = _auto["msg_id"]
+            if msg_id and _auto["day"] == today:
+                try:
+                    await bot.edit_message_media(
+                        InputMediaDocument(media=FSInputFile(path, filename=path.name), caption=_caption(meta)),
+                        chat_id=BACKUP_CHAT_ID, message_id=msg_id)
+                    return
+                except Exception as e:  # noqa: BLE001
+                    if "not modified" in str(e):
+                        return
+                    log.warning("autosave edit failed, sending new: %s", e)
+            # раз в день — новое сообщение (чтобы оно оставалось последним закреплённым), старое удаляем
+            m = await bot.send_document(BACKUP_CHAT_ID, FSInputFile(path, filename=path.name),
+                                        caption=_caption(meta), disable_notification=True)
+            try:
+                await bot.pin_chat_message(BACKUP_CHAT_ID, m.message_id, disable_notification=True)
+            except Exception as e:  # noqa: BLE001
+                log.warning("pin failed: %s", e)
+            if msg_id and msg_id != m.message_id:
+                try:
+                    await bot.delete_message(BACKUP_CHAT_ID, msg_id)
+                except Exception:
+                    pass
+            _auto["msg_id"], _auto["day"] = m.message_id, today
+        except Exception as e:  # noqa: BLE001
+            db.dirty = True
+            log.exception("autosave failed: %s", e)
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+
+async def autosave_loop(bot: Bot) -> None:
+    while True:
+        await asyncio.sleep(AUTOSAVE_MINUTES * 60)
+        await autosave(bot)
+
+
+async def startup_restore(bot: Bot) -> str | None:
+    """При запуске: запоминает закреплённую автокопию; если база пустая — восстанавливает из неё.
+    Возвращает дату копии, если восстановление произошло."""
+    pm = await find_pinned(bot)
+    if pm and pm.from_user and pm.from_user.is_bot:
+        _auto["msg_id"] = pm.message_id
+        _auto["day"] = None  # первое сохранение после запуска — новым сообщением
+    if not pm or not is_empty():
+        return None
+    tmp = DATA_DIR / "autorestore.zip"
+    await bot.download(pm.document, destination=tmp)
+    try:
+        meta = inspect(tmp)
+        restore(tmp)
+        db.dirty = False
+        return str(meta.get("created_at", "?"))[:16]
+    finally:
+        tmp.unlink(missing_ok=True)

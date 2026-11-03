@@ -28,7 +28,21 @@ async def main():
         BotCommand(command="myid", description="Мой Telegram ID"),
     ])
     await bot.delete_webhook(drop_pending_updates=False)
-    if backup.is_empty():
+    restored = None
+    try:
+        restored = await backup.startup_restore(bot)
+    except Exception as e:  # noqa: BLE001
+        logging.exception("Автовосстановление не удалось: %s", e)
+    if restored:
+        logging.warning("База была пустой — восстановлена из автокопии от %s", restored)
+        for aid in ADMIN_IDS:
+            try:
+                await bot.send_message(aid, f"♻️ <b>Данные бота восстановлены автоматически</b> из автокопии от "
+                                            f"{restored}.\nПохоже, хостинг очистил папку с данными при обновлении. "
+                                            f"Водители, маршруты, заметки и настройки на месте.")
+            except Exception:
+                pass
+    elif backup.is_empty():
         logging.warning("База данных пустая: %s", DATA_DIR)
         for aid in ADMIN_IDS:
             try:
@@ -40,6 +54,16 @@ async def main():
             except Exception:
                 pass
     asyncio.create_task(backup.daily_loop(bot))
+    asyncio.create_task(backup.autosave_loop(bot))
+
+    async def on_shutdown():
+        # BotHost останавливает бота перед пересборкой — успеваем сохранить последние изменения
+        try:
+            await asyncio.wait_for(backup.autosave(bot), timeout=20)
+        except Exception as e:  # noqa: BLE001
+            logging.warning("Автокопия при остановке не удалась: %s", e)
+
+    dp.shutdown.register(on_shutdown)
     await dp.start_polling(bot)
 
 
