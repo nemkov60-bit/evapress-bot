@@ -112,6 +112,27 @@ def close_workbook(wb_id: int, admin_id: int) -> bool:
                  (db.now_s(), admin_id, wb_id)) == 1
 
 
+def request_route_close(rid: int, uid: int) -> bool:
+    """Водитель просит закрыть рейс. False — запрос уже есть или рейс закрыт."""
+    return db.xc("UPDATE routes SET close_req_at=?, close_req_by=? WHERE id=? AND closed_at IS NULL "
+                 "AND close_req_at IS NULL", (db.now_s(), uid, rid)) == 1
+
+
+def approve_route_close(rid: int, admin_id: int) -> bool:
+    return db.xc("UPDATE routes SET closed_at=?, closed_by=?, close_req_at=NULL WHERE id=? AND closed_at IS NULL "
+                 "AND close_req_at IS NOT NULL", (db.now_s(), admin_id, rid)) == 1
+
+
+def reject_route_close(rid: int) -> bool:
+    return db.xc("UPDATE routes SET close_req_at=NULL, close_req_by=NULL WHERE id=? AND closed_at IS NULL "
+                 "AND close_req_at IS NOT NULL", (rid,)) == 1
+
+
+def reopen_route(rid: int) -> None:
+    db.x("UPDATE routes SET closed_at=NULL, closed_by=NULL, close_req_at=NULL, close_req_by=NULL WHERE id=?",
+         (rid,))
+
+
 def reopen_workbook(wb_id: int) -> None:
     db.x("UPDATE workbooks SET closed_at=NULL, closed_by=NULL WHERE id=?", (wb_id,))
 
@@ -286,14 +307,9 @@ def driver_routes(uid: int) -> list:
     """Маршруты водителя: сегодняшние + незавершённые за последние N дней."""
     since = (db.now().date() - timedelta(days=DRIVER_ROUTE_DAYS)).isoformat()
     rows = db.q("SELECT r.*, w.work_date FROM routes r JOIN workbooks w ON w.id=r.workbook_id "
-                "WHERE r.driver_id=? AND w.work_date>=? AND w.closed_at IS NULL ORDER BY w.work_date DESC", (uid, since))
-    today = db.now().date().isoformat()
-    res = []
-    for r in rows:
-        c, t = route_counts(r["id"])
-        if r["work_date"] >= today or c < t:
-            res.append(r)
-    return res
+                "WHERE r.driver_id=? AND w.work_date>=? AND w.closed_at IS NULL AND r.closed_at IS NULL "
+                "ORDER BY w.work_date DESC", (uid, since))
+    return list(rows)  # пока водитель или админ не закрыл рейс, маршрут остаётся у водителя
 
 
 def route_drivers(route) -> list[str]:
@@ -308,6 +324,10 @@ def route_drivers(route) -> list[str]:
 
 def route_state(route) -> str:
     c, t = route_counts(route["id"])
+    if route["closed_at"]:
+        return f"🏁 рейс закрыт в {fmt_time(route['closed_at'])}"
+    if route["close_req_at"]:
+        return f"⏳ водитель просит закрыть рейс (с {fmt_time(route['close_req_at'])})"
     if t and c == t:
         return "✅ выполнен"
     if route["started_at"] or c:

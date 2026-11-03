@@ -2,10 +2,32 @@
 from html import escape as h
 
 from aiogram import Bot
-from aiogram.types import InlineKeyboardMarkup
+from aiogram.types import FSInputFile, InlineKeyboardMarkup
 
 import db
-from config import ADMIN_IDS
+from config import ADMIN_IDS, BASE_DIR
+
+POSTERS = {"start": BASE_DIR / "assets" / "poster_start.jpg",
+           "thanks": BASE_DIR / "assets" / "poster_thanks.jpg"}
+
+
+async def send_poster(bot: Bot, chat_id: int, key: str, caption: str, reply_markup=None) -> None:
+    """Постер с подписью. После первой отправки Telegram даёт file_id — дальше шлём по нему, без повторной загрузки."""
+    cache_key = f"poster_file_{key}"
+    fid = db.get_setting(cache_key)
+    if fid:
+        try:
+            await bot.send_photo(chat_id, fid, caption=caption, reply_markup=reply_markup)
+            return
+        except Exception:
+            pass
+    path = POSTERS[key]
+    if not path.exists():
+        await bot.send_message(chat_id, caption, reply_markup=reply_markup)
+        return
+    msg = await bot.send_photo(chat_id, FSInputFile(path), caption=caption, reply_markup=reply_markup)
+    if msg and getattr(msg, "photo", None):
+        db.set_setting(cache_key, msg.photo[-1].file_id)
 
 
 ROLE_NAMES = {"admin": "Администратор", "customer": "Заказчик", "driver": "Водитель"}

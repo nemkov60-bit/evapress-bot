@@ -13,7 +13,7 @@ from aiogram.types import CallbackQuery, FSInputFile, InputMediaPhoto, Message, 
 import db
 import services as S
 import zipper
-from common import ROLE_NAMES, extract_content, is_admin, is_staff, role_of, send_content, user_label
+from common import ROLE_NAMES, extract_content, is_admin, is_staff, role_of, send_content, send_poster, user_label
 from config import ADMIN_IDS, WB_DIR
 from keyboards import (A_ASSIGN, A_CLOSE, A_EXPORT, A_INSTR, A_INSTR_ADD, A_INVITE, A_MSG, A_PROBLEM_TEXT,
                        A_REPORT, A_STATS, A_UPLOAD, A_USERS, A_ZIP, ADMIN_BUTTONS, ADMIN_KB, CANCEL, CANCEL_KB,
@@ -46,6 +46,7 @@ class Adm(StatesGroup):
     instr_body = State()
     msg = State()
     problem_text = State()
+    reject_reason = State()
 
 
 HELP = (
@@ -363,8 +364,7 @@ async def cb_report(cb: CallbackQuery):
         await send_content(cb.bot, cb.message.chat.id, S.report_all_text(wb))
         return
     r = db.q1("SELECT * FROM routes WHERE id=?", (int(rid),))
-    await send_content(cb.bot, cb.message.chat.id, S.report_text(wb, r),
-                       reply_markup=ikb([[("🖼 Фото по маршруту", f"ph:{r['id']}")]]))
+    await send_content(cb.bot, cb.message.chat.id, S.report_text(wb, r), reply_markup=report_kb(cb.from_user.id, r))
 
 
 @router.message(Command("report"))
@@ -384,7 +384,109 @@ async def cmd_report(message: Message, command: CommandObject, state: FSMContext
             await message.answer(f"Маршрут №{h(no)} не найден на {S.fmt_date(wb['work_date'])}.")
             continue
         await send_content(message.bot, message.chat.id, S.report_text(wb, r),
-                           reply_markup=ikb([[("🖼 Фото по маршруту", f"ph:{r['id']}")]]))
+                           reply_markup=report_kb(message.from_user.id, r))
+
+
+def report_kb(uid: int, r):
+    rows = [[("🖼 Фото по маршруту", f"ph:{r['id']}")]]
+    if r["closed_at"] and is_admin(uid):
+        rows.append([("↩️ Открыть маршрут снова", f"rro:{r['id']}")])
+    elif r["close_req_at"] and is_admin(uid):
+        rows.append([("✅ Подтвердить закрытие", f"rca:{r['id']}"), ("❌ Отклонить", f"rcr:{r['id']}")])
+    return ikb(rows)
+
+
+@router.callback_query(F.data.startswith("rca:"), ADM)
+async def cb_route_close_approve(cb: CallbackQuery, bot: Bot):
+    rid = int(cb.data[4:])
+    r = S.route_with_wb(rid)
+    if not S.approve_route_close(rid, cb.from_user.id):
+        await cb.answer("Запрос уже обработан", show_alert=True)
+        return
+    await cb.answer("Закрытие подтверждено")
+    try:
+        await cb.message.edit_reply_markup(reply_markup=ikb([[("↩️ Открыть маршрут снова", f"rro:{rid}")]]))
+    except Exception:
+        pass
+    c, t = S.route_counts(rid)
+    await cb.message.answer(f"✅ Рейс по маршруту №{h(r['route_no'])} ({S.fmt_date(r['work_date'])}) закрыт. "
+                            f"Закрыто точек: {c} из {t}.")
+    driver = r["close_req_by"] or r["driver_id"]
+    if driver:
+        try:
+            await send_poster(bot, driver, "thanks",
+                              f"🏁 Логист подтвердил закрытие рейса по маршруту №{h(r['route_no'])} на "
+                              f"{S.fmt_date(r['work_date'])}.\nЗакрыто точек: {c} из {t}.\n\n"
+                              f"Благодарим за отличную работу!")
+        except Exception:
+            pass
+
+
+@router.callback_query(F.data.startswith("rcr:"), ADM)
+async def cb_route_close_reject(cb: CallbackQuery, state: FSMContext):
+    rid = int(cb.data[4:])
+    r = S.route_with_wb(rid)
+    if r["closed_at"] or not r["close_req_at"]:
+        await cb.answer("Запрос уже обработан", show_alert=True)
+        return
+    await cb.answer()
+    await state.set_state(Adm.reject_reason)
+    await state.update_data(reject_rid=rid)
+    await cb.message.answer(f"❌ Отклонить закрытие рейса по маршруту №{h(r['route_no'])}.\n"
+                            f"Напишите водителю причину или что нужно сделать:",
+                            reply_markup=ikb([[("Отклонить без комментария", f"rcn:{rid}")]]))
+
+
+async def _reject(message: Message, rid: int, reason: str, bot: Bot, admin_id: int):
+    r = S.route_with_wb(rid)
+    if not S.reject_route_close(rid):
+        await message.answer("Запрос уже обработан.", reply_markup=ADMIN_KB)
+        return
+    await message.answer(f"❌ Закрытие рейса по маршруту №{h(r['route_no'])} отклонено, водитель уведомлён.",
+                         reply_markup=ADMIN_KB)
+    driver = r["close_req_by"] or r["driver_id"]
+    if driver:
+        try:
+            await bot.send_message(driver, f"❌ Логист отклонил закрытие рейса по маршруту №{h(r['route_no'])} "
+                                           f"на {S.fmt_date(r['work_date'])}."
+                                           + (f"\n\n💬 {reason}" if reason else "")
+                                           + "\n\nПродолжайте маршрут.",
+                                   reply_markup=ikb([[("🗺 Открыть маршрут", f"r:{rid}")]]))
+        except Exception:
+            pass
+
+
+@router.callback_query(F.data.startswith("rcn:"), ADM)
+async def cb_route_close_reject_silent(cb: CallbackQuery, state: FSMContext, bot: Bot):
+    await state.clear()
+    await cb.answer()
+    await _reject(cb.message, int(cb.data[4:]), "", bot, cb.from_user.id)
+
+
+@router.message(Adm.reject_reason, F.text, NOT_MENU, ADM)
+async def route_close_reject_reason(message: Message, state: FSMContext, bot: Bot):
+    rid = (await state.get_data()).get("reject_rid")
+    await state.clear()
+    await _reject(message, rid, message.html_text, bot, message.from_user.id)
+
+
+@router.callback_query(F.data.startswith("rro:"), ADM)
+async def cb_route_reopen(cb: CallbackQuery, bot: Bot):
+    rid = int(cb.data[4:])
+    r = S.route_with_wb(rid)
+    if r["wb_closed_at"]:
+        await cb.answer("Рейс на эту дату закрыт целиком. Сначала откройте его снова.", show_alert=True)
+        return
+    S.reopen_route(rid)
+    await cb.answer("Маршрут открыт")
+    await cb.message.answer(f"↩️ Маршрут №{h(r['route_no'])} ({S.fmt_date(r['work_date'])}) снова открыт: "
+                            f"водитель может закрывать точки.")
+    if r["driver_id"]:
+        try:
+            await bot.send_message(r["driver_id"], f"↩️ Логист снова открыл маршрут №{h(r['route_no'])} на "
+                                                   f"{S.fmt_date(r['work_date'])}. Нажмите «📋 Мой маршрут».")
+        except Exception:
+            pass
 
 
 @router.callback_query(F.data.startswith("ph:"))
@@ -835,12 +937,16 @@ async def do_close(message: Message, wb_id: int, admin_id: int, bot: Bot) -> Non
     if not S.close_workbook(wb_id, admin_id):
         await message.answer("Рейс уже закрыт.")
     wb = db.q1("SELECT * FROM workbooks WHERE id=?", (wb_id,))
-    for r in db.q("SELECT DISTINCT driver_id FROM routes WHERE workbook_id=? AND driver_id IS NOT NULL", (wb_id,)):
+    # постер благодарности — водителям, которые не закрыли рейс сами (те уже получили его)
+    for r in db.q("SELECT DISTINCT driver_id FROM routes WHERE workbook_id=? AND driver_id IS NOT NULL "
+                  "AND closed_at IS NULL", (wb_id,)):
         try:
-            await bot.send_message(r["driver_id"], f"🔒 Рейс на {S.fmt_date(wb['work_date'])} закрыт "
-                                                   f"администратором. Спасибо за работу!")
+            await send_poster(bot, r["driver_id"], "thanks",
+                              f"🔒 Рейс на {S.fmt_date(wb['work_date'])} закрыт администратором.\n\n"
+                              f"Благодарим за отличную работу!")
         except Exception:
             pass
+    db.x("UPDATE routes SET close_req_at=NULL, close_req_by=NULL WHERE workbook_id=?", (wb_id,))
     await send_content(bot, message.chat.id, S.report_all_text(wb))
     await send_export(message, wb)
 

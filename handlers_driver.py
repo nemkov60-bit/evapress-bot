@@ -10,7 +10,7 @@ from aiogram.types import CallbackQuery, InputMediaDocument, InputMediaPhoto, In
 
 import db
 import services as S
-from common import ROLE_NAMES, admin_ids, extract_content, notify_admins, role_of, send_content, user_label
+from common import ROLE_NAMES, admin_ids, extract_content, notify_admins, role_of, send_content, send_poster, user_label
 from keyboards import (DRIVER_BUTTONS, B_INSTR, B_MY_ROUTE, B_PROBLEM, B_SEND_PROBLEM, B_START, CANCEL, CANCEL_KB,
                        DRIVER_KB, PROBLEM_KB, ikb, kb_for, short)
 
@@ -88,25 +88,29 @@ def get_driver(uid: int):
 def own_point(uid: int, pid: int):
     """Точка, если она на маршруте этого водителя и рейс не закрыт."""
     return db.q1("SELECT p.* FROM points p JOIN routes r ON r.id=p.route_id JOIN workbooks w ON w.id=r.workbook_id "
-                 "WHERE p.id=? AND r.driver_id=? AND w.closed_at IS NULL", (pid, uid))
+                 "WHERE p.id=? AND r.driver_id=? AND w.closed_at IS NULL AND r.closed_at IS NULL", (pid, uid))
 
 
 def own_route(uid: int, rid: int):
     r = S.route_with_wb(rid)
-    return r if r and r["driver_id"] == uid and not r["wb_closed_at"] else None
+    return r if r and r["driver_id"] == uid and not r["wb_closed_at"] and not r["closed_at"] else None
 
 
 def route_view(rid: int):
     r = S.route_with_wb(rid)
     c, t = S.route_counts(rid)
     text = (f"🗺 <b>Маршрут №{h(r['route_no'])} на {S.fmt_date(r['work_date'])}</b>\n"
-            f"Закрыто точек: <b>{c} из {t}</b>\n\n"
-            f"Нажмите на точку, чтобы посмотреть подробности и открыть её.")
+            f"Закрыто точек: <b>{c} из {t}</b>\n"
+            + ("⏳ <b>Запрос на закрытие рейса отправлен логисту, ожидайте подтверждения.</b>\n"
+               if r["close_req_at"] else "")
+            + "\nНажмите на точку, чтобы посмотреть подробности и открыть её.")
     rows = []
     for p in db.q("SELECT * FROM points WHERE route_id=? ORDER BY seq", (rid,)):
         icon = "✅" if p["status"] == "closed" else ("🟡" if p["opened_at"] else "⬜")
         rows.append([(f"{icon} {p['seq']}. {short(p['address'], 45)}", f"p:{p['id']}")])
     rows.append([("🔄 Обновить", f"r:{rid}")])
+    if not r["close_req_at"]:
+        rows.append([("🏁 Закрыть рейс", f"rc:{rid}")])
     return text, ikb(rows)
 
 
@@ -152,7 +156,8 @@ async def start(message: Message, state: FSMContext, command: CommandObject | No
     await state.clear()
     uid = message.from_user.id
     if get_driver(uid):
-        await message.answer("👋 Здравствуйте! Выберите действие в меню.", reply_markup=DRIVER_KB)
+        await send_poster(message.bot, message.chat.id, "start",
+                          "👋 Здравствуйте, уважаемый водитель! Выберите действие в меню.", reply_markup=DRIVER_KB)
         return
     arg = (command.args or "") if command else ""
     if arg.startswith("inv_"):
@@ -164,7 +169,7 @@ async def start(message: Message, state: FSMContext, command: CommandObject | No
         await state.set_state(Reg.name)
         await state.update_data(invite=inv["code"])
         if inv["role"] == "driver":
-            await message.answer(DRIVER_WELCOME)
+            await send_poster(message.bot, message.chat.id, "start", DRIVER_WELCOME)
         else:
             await message.answer(f"👋 Здравствуйте! Вас пригласили в бот транспортного логиста EVA Press "
                                  f"с ролью <b>{ROLE_NAMES.get(inv['role'], inv['role'])}</b>.\n\n"
@@ -429,12 +434,72 @@ async def cb_close(cb: CallbackQuery, state: FSMContext, bot: Bot):
     if c == t:
         r = S.route_with_wb(rid)
         db.x("UPDATE routes SET finished_at=? WHERE id=?", (db.now_s(), rid))
-        await cb.message.answer("🎉 Все точки маршрута закрыты. Маршрут выполнен! Спасибо!")
-        await notify_admins(bot, f"🏁 {user_label(uid)} выполнил маршрут №{h(r['route_no'])} "
-                                 f"({S.fmt_date(r['work_date'])}): закрыто {c} из {t}.")
+        await cb.message.answer("🎉 Все точки маршрута закрыты! Нажмите «🏁 Закрыть рейс», чтобы завершить маршрут.",
+                                reply_markup=ikb([[("🏁 Закрыть рейс", f"rc:{rid}")]]))
+        await notify_admins(bot, f"✅ {user_label(uid)} закрыл все точки маршрута №{h(r['route_no'])} "
+                                 f"({S.fmt_date(r['work_date'])}): {c} из {t}.")
     else:
         text, markup = route_view(rid)
         await cb.message.answer(text, reply_markup=markup)
+
+
+# ------------------------------------------------------------ close route -
+
+@router.callback_query(F.data.startswith("rc:"))
+async def cb_route_close_ask(cb: CallbackQuery):
+    rid = int(cb.data[3:])
+    r = own_route(cb.from_user.id, rid)
+    if not r:
+        await cb.answer("Маршрут недоступен: рейс уже закрыт или маршрут снят", show_alert=True)
+        return
+    if r["close_req_at"]:
+        await cb.answer("Запрос уже отправлен, ожидайте решения логиста", show_alert=True)
+        return
+    c, t = S.route_counts(rid)
+    await cb.answer()
+    text = (f"🏁 Закрыть рейс — маршрут №{h(r['route_no'])} на {S.fmt_date(r['work_date'])}?\n"
+            f"Запрос уйдёт логисту на подтверждение.\n\n")
+    if c < t:
+        opened = db.q("SELECT seq, address FROM points WHERE route_id=? AND status!='closed' ORDER BY seq", (rid,))
+        text += (f"⚠️ Не закрыто точек: <b>{t - c}</b> из {t}:\n"
+                 + "\n".join(f"{p['seq']}. {h(short(p['address'], 60))}" for p in opened[:20])
+                 + ("\n…" if len(opened) > 20 else "")
+                 + "\n\nПосле закрытия рейса закрыть эти точки будет нельзя. Если на адресе проблема — "
+                   "сначала сообщите о ней кнопкой «⚠️ Проблема на адресе».")
+    else:
+        text += f"Все точки закрыты: {c} из {t}."
+    await cb.message.answer(text, reply_markup=ikb([[("✅ Да, отправить запрос", f"rcc:{rid}")],
+                                                     [("⬅️ Вернуться к маршруту", f"r:{rid}")]]))
+
+
+@router.callback_query(F.data.startswith("rcc:"))
+async def cb_route_close(cb: CallbackQuery, state: FSMContext, bot: Bot):
+    uid = cb.from_user.id
+    rid = int(cb.data[4:])
+    r = own_route(uid, rid)
+    if not r or not S.request_route_close(rid, uid):
+        await cb.answer("Запрос уже отправлен или рейс закрыт", show_alert=True)
+        return
+    await state.clear()
+    await cb.answer("Запрос отправлен")
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    c, t = S.route_counts(rid)
+    await cb.message.answer("⏳ Запрос на закрытие рейса отправлен логисту. Как только он подтвердит, "
+                            "вы получите уведомление.", reply_markup=DRIVER_KB)
+    text = (f"🏁 <b>Запрос на закрытие рейса</b>\n"
+            f"👤 {user_label(uid)}\n"
+            f"🗺 Маршрут №{h(r['route_no'])} ({S.fmt_date(r['work_date'])})\n"
+            f"Закрыто точек: <b>{c} из {t}</b>" + (f", <b>не закрыто {t - c}</b>" if c < t else "") + ".")
+    if c < t:
+        opened = db.q("SELECT seq, address FROM points WHERE route_id=? AND status!='closed' ORDER BY seq", (rid,))
+        text += "\n\nНе закрыты:\n" + "\n".join(f"{p['seq']}. {h(short(p['address'], 60))}" for p in opened[:20])
+        text += "\n…" if len(opened) > 20 else ""
+    await notify_admins(bot, text, reply_markup=ikb([[("✅ Подтвердить закрытие", f"rca:{rid}")],
+                                                     [("❌ Отклонить", f"rcr:{rid}")],
+                                                     [("📑 Отчёт по маршруту", f"rp:{r['workbook_id']}:{rid}")]]))
 
 
 # ------------------------------------------------------------ problem -----

@@ -87,6 +87,12 @@ def _add_col(table: str, col: str, ddl: str) -> None:
 _add_col("users", "role", "role TEXT DEFAULT 'driver'")        # admin / customer / driver
 _add_col("workbooks", "closed_at", "closed_at TEXT")
 _add_col("workbooks", "closed_by", "closed_by INTEGER")
+# v4: водитель сам закрывает свой рейс (маршрут)
+_add_col("routes", "closed_at", "closed_at TEXT")
+_add_col("routes", "closed_by", "closed_by INTEGER")
+# v5: запрос водителя на закрытие рейса, ждёт решения администратора
+_add_col("routes", "close_req_at", "close_req_at TEXT")
+_add_col("routes", "close_req_by", "close_req_by INTEGER")
 conn.executescript("""
 CREATE TABLE IF NOT EXISTS invites(
     code TEXT PRIMARY KEY,
