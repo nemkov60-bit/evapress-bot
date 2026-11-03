@@ -3,9 +3,15 @@ from datetime import datetime
 
 from config import DB_PATH, TZ
 
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-conn.row_factory = sqlite3.Row
-conn.execute("PRAGMA foreign_keys = ON")
+conn: sqlite3.Connection = None  # type: ignore[assignment]
+
+
+def _open() -> sqlite3.Connection:
+    c = sqlite3.connect(DB_PATH, check_same_thread=False)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA foreign_keys = ON")
+    return c
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(
@@ -74,70 +80,84 @@ CREATE TABLE IF NOT EXISTS admin_messages(
 CREATE INDEX IF NOT EXISTS ix_points_route ON points(route_id);
 CREATE INDEX IF NOT EXISTS ix_routes_driver ON routes(driver_id);
 """
-conn.executescript(SCHEMA)
+
+def migrate() -> None:
+    """Создаёт таблицы и добавляет новые колонки. Только добавляет — существующие данные не трогает."""
+    conn.executescript(SCHEMA)
 
 
-def _add_col(table: str, col: str, ddl: str) -> None:
-    cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
-    if col not in cols:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+    def _add_col(table: str, col: str, ddl: str) -> None:
+        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if col not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
 
-# миграции v2: роли, приглашения, закрытие рейса
-_add_col("users", "role", "role TEXT DEFAULT 'driver'")        # admin / customer / driver
-_add_col("workbooks", "closed_at", "closed_at TEXT")
-_add_col("workbooks", "closed_by", "closed_by INTEGER")
-# v4: водитель сам закрывает свой рейс (маршрут)
-_add_col("routes", "closed_at", "closed_at TEXT")
-_add_col("routes", "closed_by", "closed_by INTEGER")
-# v5: запрос водителя на закрытие рейса, ждёт решения администратора
-_add_col("routes", "close_req_at", "close_req_at TEXT")
-_add_col("routes", "close_req_by", "close_req_by INTEGER")
-# v6: важные примечания администратора и заметки водителей
-conn.executescript("""
-CREATE TABLE IF NOT EXISTS notes(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    scope TEXT NOT NULL,             -- point / route
-    point_key TEXT,                  -- 1c:<№ 1С> или addr:<адрес> (для scope=point)
-    route_no TEXT,                   -- номер маршрута (для scope=route; для point — где оставлена)
-    work_date TEXT,                  -- NULL = постоянно, иначе только на эту дату
-    text TEXT NOT NULL,
-    author_id INTEGER,
-    author_role TEXT,                -- admin / driver
-    status TEXT NOT NULL,            -- approved / pending / rejected / deleted
-    created_at TEXT, decided_by INTEGER, decided_at TEXT
-);
-CREATE INDEX IF NOT EXISTS ix_notes_point ON notes(point_key);
-CREATE INDEX IF NOT EXISTS ix_notes_route ON notes(route_no);
-""")
-conn.executescript("""
-CREATE TABLE IF NOT EXISTS invites(
-    code TEXT PRIMARY KEY,
-    role TEXT NOT NULL,
-    created_by INTEGER,
-    created_at TEXT,
-    expires_at TEXT,
-    used_by INTEGER,
-    used_at TEXT,
-    revoked INTEGER DEFAULT 0
-);
--- v3: дополнительные фото к точке и фото к «Проблеме на адресе», без ограничения по количеству
-CREATE TABLE IF NOT EXISTS photos(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind TEXT NOT NULL,              -- extra / problem
-    point_id INTEGER, route_id INTEGER, problem_id INTEGER, driver_id INTEGER,
-    file_id TEXT NOT NULL, file_type TEXT, file_name TEXT,
-    created_at TEXT
-);
-CREATE INDEX IF NOT EXISTS ix_photos_point ON photos(point_id);
-CREATE INDEX IF NOT EXISTS ix_photos_problem ON photos(problem_id);
-""")
-# перенос единственного фото из старых записей problems в photos
-conn.execute("""INSERT INTO photos(kind, point_id, route_id, problem_id, driver_id, file_id, file_type, created_at)
-                SELECT 'problem', point_id, route_id, id, driver_id, file_id, file_type, created_at
-                FROM problems WHERE file_id IS NOT NULL""")
-conn.execute("UPDATE problems SET file_id=NULL WHERE file_id IS NOT NULL")
-conn.commit()
+    # миграции v2: роли, приглашения, закрытие рейса
+    _add_col("users", "role", "role TEXT DEFAULT 'driver'")        # admin / customer / driver
+    _add_col("workbooks", "closed_at", "closed_at TEXT")
+    _add_col("workbooks", "closed_by", "closed_by INTEGER")
+    # v4: водитель сам закрывает свой рейс (маршрут)
+    _add_col("routes", "closed_at", "closed_at TEXT")
+    _add_col("routes", "closed_by", "closed_by INTEGER")
+    # v5: запрос водителя на закрытие рейса, ждёт решения администратора
+    _add_col("routes", "close_req_at", "close_req_at TEXT")
+    _add_col("routes", "close_req_by", "close_req_by INTEGER")
+    # v6: важные примечания администратора и заметки водителей
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS notes(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scope TEXT NOT NULL,             -- point / route
+        point_key TEXT,                  -- 1c:<№ 1С> или addr:<адрес> (для scope=point)
+        route_no TEXT,                   -- номер маршрута (для scope=route; для point — где оставлена)
+        work_date TEXT,                  -- NULL = постоянно, иначе только на эту дату
+        text TEXT NOT NULL,
+        author_id INTEGER,
+        author_role TEXT,                -- admin / driver
+        status TEXT NOT NULL,            -- approved / pending / rejected / deleted
+        created_at TEXT, decided_by INTEGER, decided_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS ix_notes_point ON notes(point_key);
+    CREATE INDEX IF NOT EXISTS ix_notes_route ON notes(route_no);
+    """)
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS invites(
+        code TEXT PRIMARY KEY,
+        role TEXT NOT NULL,
+        created_by INTEGER,
+        created_at TEXT,
+        expires_at TEXT,
+        used_by INTEGER,
+        used_at TEXT,
+        revoked INTEGER DEFAULT 0
+    );
+    -- v3: дополнительные фото к точке и фото к «Проблеме на адресе», без ограничения по количеству
+    CREATE TABLE IF NOT EXISTS photos(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL,              -- extra / problem
+        point_id INTEGER, route_id INTEGER, problem_id INTEGER, driver_id INTEGER,
+        file_id TEXT NOT NULL, file_type TEXT, file_name TEXT,
+        created_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS ix_photos_point ON photos(point_id);
+    CREATE INDEX IF NOT EXISTS ix_photos_problem ON photos(problem_id);
+    """)
+    # перенос единственного фото из старых записей problems в photos
+    conn.execute("""INSERT INTO photos(kind, point_id, route_id, problem_id, driver_id, file_id, file_type, created_at)
+                    SELECT 'problem', point_id, route_id, id, driver_id, file_id, file_type, created_at
+                    FROM problems WHERE file_id IS NOT NULL""")
+    conn.execute("UPDATE problems SET file_id=NULL WHERE file_id IS NOT NULL")
+    conn.commit()
+
+
+def reload() -> None:
+    """(Пере)подключение к базе — при старте и после восстановления из резервной копии."""
+    global conn
+    conn = _open()
+    migrate()
+
+
+reload()
+
 
 
 def now() -> datetime:

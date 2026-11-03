@@ -261,7 +261,11 @@ def export_workbook(wb_id: int) -> Path:
             rows[p["row_idx"]] = (tk, comment)
         updates[r["sheet_name"]] = {"tk_col": r["tk_col"], "comment_col": r["comment_col"], "rows": rows}
     dst = EXPORT_DIR / wb["filename"]
-    excel.export_workbook(wb["path"], dst, updates)
+    src = Path(wb["path"])
+    if not src.exists():  # база перенесена на другой сервер / в другую папку
+        from config import WB_DIR
+        src = WB_DIR / src.name
+    excel.export_workbook(src, dst, updates)
     return dst
 
 

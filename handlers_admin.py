@@ -10,13 +10,14 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, InputMediaPhoto, Message, ReplyKeyboardRemove
 
+import backup
 import db
 import notes as N
 import services as S
 import zipper
 from common import ROLE_NAMES, extract_content, is_admin, is_staff, role_of, send_content, send_poster, user_label
 from config import ADMIN_IDS, WB_DIR
-from keyboards import (A_ASSIGN, A_CLOSE, A_NOTES, A_EXPORT, A_INSTR, A_INSTR_ADD, A_INVITE, A_MSG, A_PROBLEM_TEXT,
+from keyboards import (A_ASSIGN, A_BACKUP, A_CLOSE, A_NOTES, A_EXPORT, A_INSTR, A_INSTR_ADD, A_INVITE, A_MSG, A_PROBLEM_TEXT,
                        A_REPORT, A_STATS, A_UPLOAD, A_USERS, A_ZIP, ADMIN_BUTTONS, ADMIN_KB, CANCEL, CANCEL_KB,
                        ikb, kb_for, short)
 
@@ -156,6 +157,10 @@ async def upload_hint(message: Message, state: FSMContext):
 async def upload_file(message: Message, state: FSMContext, bot: Bot):
     doc = message.document
     name = doc.file_name or "routes.xlsx"
+    if name.lower().endswith(".zip") and (name.startswith(backup.PREFIX) or
+                                          (message.caption or "").startswith("/restore")):
+        await state.clear()
+        return await restore_ask(message, state, bot)
     if not name.lower().endswith((".xlsx", ".xlsm")):
         if await state.get_state() in (Adm.instr_body.state, Adm.msg.state):
             return await route_state_doc(message, state, bot)
@@ -1226,6 +1231,75 @@ async def cb_note_decide(cb: CallbackQuery, bot: Bot):
                                + f"\n\n{n['text']}")
     except Exception:
         pass
+
+
+# ------------------------------------------------------------ backup ------
+
+@router.message(Command("backup"), ADM)
+@router.message(F.text == A_BACKUP, ADM)
+async def cmd_backup(message: Message, state: FSMContext, bot: Bot):
+    await state.clear()
+    await message.answer("⏳ Готовлю резервную копию…")
+    await backup.send_backup(bot, "по запросу", {message.from_user.id})
+
+
+@router.message(Command("restore"), ADM)
+async def cmd_restore_hint(message: Message):
+    await message.answer("Чтобы восстановить данные, отправьте боту файл резервной копии "
+                         f"(<code>{backup.PREFIX}….zip</code>) — бот покажет, что в нём, и попросит подтвердить.")
+
+
+async def restore_ask(message: Message, state: FSMContext, bot: Bot):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("Восстанавливать данные могут только администраторы из настройки ADMIN_IDS.")
+        return
+    tmp = WB_DIR.parent / f"restore_{message.message_id}.zip"
+    await bot.download(message.document, destination=tmp)
+    try:
+        meta = backup.inspect(tmp)
+    except Exception as e:  # noqa: BLE001
+        tmp.unlink(missing_ok=True)
+        await message.answer(f"❌ Не получилось прочитать копию: {h(str(e))}")
+        return
+    cur = backup.counts(db.conn)
+    await state.update_data(restore_path=str(tmp))
+    fmt = lambda c: ", ".join(f"{k}: {v}" for k, v in c.items())  # noqa: E731
+    await message.answer(f"💾 <b>Восстановление из резервной копии</b>\n"
+                         f"Копия от {h(str(meta.get('created_at', '?'))[:16])}\n"
+                         f"В копии — {fmt(meta['counts'])}\n"
+                         f"Сейчас в боте — {fmt(cur)}\n\n"
+                         f"⚠️ Текущие данные будут заменены данными из копии (перед заменой бот сохранит их "
+                         f"отдельным файлом на сервере). Продолжить?",
+                         reply_markup=ikb([[("✅ Восстановить", "bkr")], [("Отмена", "bkn")]]))
+
+
+@router.callback_query(F.data.in_({"bkr", "bkn"}), ADM)
+async def cb_restore(cb: CallbackQuery, state: FSMContext):
+    path = (await state.get_data()).get("restore_path")
+    await state.clear()
+    await cb.answer()
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    if not path or not Path(path).exists():
+        await cb.message.answer("Файл копии не найден, отправьте его ещё раз.")
+        return
+    if cb.data == "bkn" or cb.from_user.id not in ADMIN_IDS:
+        Path(path).unlink(missing_ok=True)
+        await cb.message.answer("Отменено.")
+        return
+    try:
+        safety = backup.restore(Path(path))
+    except Exception as e:  # noqa: BLE001
+        await cb.message.answer(f"❌ Восстановление не удалось, данные не изменены: {h(str(e))}")
+        return
+    finally:
+        Path(path).unlink(missing_ok=True)
+    c = backup.counts(db.conn)
+    await cb.message.answer("✅ Данные восстановлены: " + ", ".join(f"{k}: {v}" for k, v in c.items())
+                            + f".\nПрежняя база сохранена на сервере: <code>{h(safety.name)}</code>",
+                            reply_markup=ADMIN_KB)
 
 
 # ------------------------------------------------------------ problem text
