@@ -9,6 +9,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InputMediaDocument, InputMediaPhoto, InputMediaVideo, Message
 
 import db
+import notes as N
 import services as S
 from common import ROLE_NAMES, admin_ids, extract_content, notify_admins, role_of, send_content, send_poster, user_label
 from keyboards import (DRIVER_BUTTONS, B_INSTR, B_MY_ROUTE, B_PROBLEM, B_SEND_PROBLEM, B_START, CANCEL, CANCEL_KB,
@@ -29,6 +30,10 @@ class ProblemFlow(StatesGroup):
     text = State()
 
 
+class NoteFlow(StatesGroup):
+    text = State()
+
+
 NOT_MENU = ~F.text.in_(DRIVER_BUTTONS | {CANCEL, B_SEND_PROBLEM})
 
 PHOTO_HINT = "📌 <i>Следите за тем, чтобы фото были чёткие и читабельные.</i>"
@@ -39,7 +44,8 @@ STEP_PROMPTS = {
     "poa": "📸 <b>Фото 3 из 3:</b> доверенность на возврат.\n"
            "Отправьте фотографию или нажмите «Доверенность отсутствует».\n\n" + PHOTO_HINT,
 }
-DRIVER_WELCOME = ("Здравствуйте, уважаемый водитель! С данным ботом выполнять доставку станет проще и удобнее. "
+DRIVER_WELCOME = ("Здравствуйте, уважаемый водитель!\n"
+                  "С данным ботом выполнять доставку станет проще и удобнее.\n\n"
                   "Для регистрации введите ваши Имя и Фамилию:")
 
 # Отложенный ответ: когда водитель шлёт альбом из 10 фото, бот отвечает один раз, а не 10
@@ -104,10 +110,17 @@ def route_view(rid: int):
             + ("⏳ <b>Запрос на закрытие рейса отправлен логисту, ожидайте подтверждения.</b>\n"
                if r["close_req_at"] else "")
             + "\nНажмите на точку, чтобы посмотреть подробности и открыть её.")
+    rblock = N.route_block(r["route_no"], r["work_date"])
+    flagged = N.points_with_notes(rid, r["work_date"])
+    if rblock:
+        text = rblock + "\n\n" + text
+    if flagged:
+        text += "\n❗ — у точки есть важная информация или заметки водителей."
     rows = []
     for p in db.q("SELECT * FROM points WHERE route_id=? ORDER BY seq", (rid,)):
         icon = "✅" if p["status"] == "closed" else ("🟡" if p["opened_at"] else "⬜")
-        rows.append([(f"{icon} {p['seq']}. {short(p['address'], 45)}", f"p:{p['id']}")])
+        mark = "❗" if p["id"] in flagged else ""
+        rows.append([(f"{icon}{mark} {p['seq']}. {short(p['address'], 43)}", f"p:{p['id']}")])
     rows.append([("🔄 Обновить", f"r:{rid}")])
     if not r["close_req_at"]:
         rows.append([("🏁 Закрыть рейс", f"rc:{rid}")])
@@ -115,11 +128,14 @@ def route_view(rid: int):
 
 
 def point_view(p):
-    text = S.point_text(p)
+    r = S.route_with_wb(p["route_id"])
+    block = N.point_block(p, r["work_date"])
+    text = S.point_text(p, r) + ("\n\n" + block if block else "")
     rows = []
     if p["status"] != "closed":
         rows.append([("📍 Открыть точку", f"po:{p['id']}")])
     rows.append([("⚠️ Проблема на адресе", f"pp:{p['id']}")])
+    rows.append([("📝 Заметка к адресу", f"dn:{p['id']}")])
     rows.append([("⬅️ К списку точек", f"r:{p['route_id']}")])
     return text, ikb(rows)
 
@@ -324,6 +340,10 @@ async def cb_open_point(cb: CallbackQuery, state: FSMContext):
         db.x("UPDATE points SET opened_at=? WHERE id=?", (db.now_s(), p["id"]))
         p = own_point(cb.from_user.id, p["id"])
     await cb.answer("Точка открыта")
+    r = S.route_with_wb(p["route_id"])
+    block = N.point_block(p, r["work_date"])
+    if block:
+        await cb.message.answer(f"📍 <b>{h(short(p['address'], 80))}</b>\n\n{block}")
     await ask_step(cb.message, state, p)
 
 
@@ -500,6 +520,50 @@ async def cb_route_close(cb: CallbackQuery, state: FSMContext, bot: Bot):
     await notify_admins(bot, text, reply_markup=ikb([[("✅ Подтвердить закрытие", f"rca:{rid}")],
                                                      [("❌ Отклонить", f"rcr:{rid}")],
                                                      [("📑 Отчёт по маршруту", f"rp:{r['workbook_id']}:{rid}")]]))
+
+
+# ------------------------------------------------------------ driver note -
+
+@router.callback_query(F.data.startswith("dn:"))
+async def cb_driver_note(cb: CallbackQuery, state: FSMContext):
+    p = own_point(cb.from_user.id, int(cb.data[3:]))
+    if not p:
+        await cb.answer("Точка недоступна: рейс закрыт или маршрут снят", show_alert=True)
+        return
+    await cb.answer()
+    await state.set_state(NoteFlow.text)
+    await state.update_data(note_point=p["id"])
+    await cb.message.answer(f"📝 <b>Заметка к адресу</b> {h(short(p['address'], 80))}\n\n"
+                            f"Напишите, что полезно знать водителям, которые поедут сюда в следующий раз: "
+                            f"где въезд и разгрузка, часы приёмки, к кому обратиться и т.п.\n"
+                            f"Заметку проверит логист, после утверждения её увидят все водители на этом адресе.",
+                            reply_markup=CANCEL_KB)
+
+
+@router.message(NoteFlow.text, F.text, NOT_MENU)
+async def driver_note_text(message: Message, state: FSMContext, bot: Bot):
+    uid = message.from_user.id
+    pid = (await state.get_data()).get("note_point")
+    await state.clear()
+    p = own_point(uid, pid)
+    if not p:
+        await message.answer("Точка недоступна.", reply_markup=DRIVER_KB)
+        return
+    r = S.route_with_wb(p["route_id"])
+    nid = N.add("point", h(message.text.strip()), uid, "driver", "pending", point_key_=N.point_key(p),
+                route_no=r["route_no"])
+    await message.answer("✅ Заметка отправлена логисту на проверку. После утверждения её увидят другие водители.",
+                         reply_markup=DRIVER_KB)
+    await notify_admins(bot, f"📝 <b>Заметка водителя на утверждение</b>\n"
+                             f"👤 {user_label(uid)}\n"
+                             f"📍 {h(p['network'])} — {h(p['address'])} (маршрут №{h(r['route_no'])})\n\n"
+                             f"{h(message.text.strip())}",
+                        reply_markup=ikb([[("✅ Утвердить", f"nok:{nid}"), ("❌ Отклонить", f"nno:{nid}")]]))
+
+
+@router.message(NoteFlow.text, NOT_MENU)
+async def driver_note_not_text(message: Message):
+    await message.answer("Заметка принимается только текстом.")
 
 
 # ------------------------------------------------------------ problem -----

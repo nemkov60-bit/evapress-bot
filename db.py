@@ -93,6 +93,23 @@ _add_col("routes", "closed_by", "closed_by INTEGER")
 # v5: запрос водителя на закрытие рейса, ждёт решения администратора
 _add_col("routes", "close_req_at", "close_req_at TEXT")
 _add_col("routes", "close_req_by", "close_req_by INTEGER")
+# v6: важные примечания администратора и заметки водителей
+conn.executescript("""
+CREATE TABLE IF NOT EXISTS notes(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope TEXT NOT NULL,             -- point / route
+    point_key TEXT,                  -- 1c:<№ 1С> или addr:<адрес> (для scope=point)
+    route_no TEXT,                   -- номер маршрута (для scope=route; для point — где оставлена)
+    work_date TEXT,                  -- NULL = постоянно, иначе только на эту дату
+    text TEXT NOT NULL,
+    author_id INTEGER,
+    author_role TEXT,                -- admin / driver
+    status TEXT NOT NULL,            -- approved / pending / rejected / deleted
+    created_at TEXT, decided_by INTEGER, decided_at TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_notes_point ON notes(point_key);
+CREATE INDEX IF NOT EXISTS ix_notes_route ON notes(route_no);
+""")
 conn.executescript("""
 CREATE TABLE IF NOT EXISTS invites(
     code TEXT PRIMARY KEY,

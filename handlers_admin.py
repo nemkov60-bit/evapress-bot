@@ -11,11 +11,12 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, InputMediaPhoto, Message, ReplyKeyboardRemove
 
 import db
+import notes as N
 import services as S
 import zipper
 from common import ROLE_NAMES, extract_content, is_admin, is_staff, role_of, send_content, send_poster, user_label
 from config import ADMIN_IDS, WB_DIR
-from keyboards import (A_ASSIGN, A_CLOSE, A_EXPORT, A_INSTR, A_INSTR_ADD, A_INVITE, A_MSG, A_PROBLEM_TEXT,
+from keyboards import (A_ASSIGN, A_CLOSE, A_NOTES, A_EXPORT, A_INSTR, A_INSTR_ADD, A_INVITE, A_MSG, A_PROBLEM_TEXT,
                        A_REPORT, A_STATS, A_UPLOAD, A_USERS, A_ZIP, ADMIN_BUTTONS, ADMIN_KB, CANCEL, CANCEL_KB,
                        ikb, kb_for, short)
 
@@ -47,6 +48,7 @@ class Adm(StatesGroup):
     msg = State()
     problem_text = State()
     reject_reason = State()
+    note_text = State()
 
 
 HELP = (
@@ -226,8 +228,11 @@ async def cb_date(cb: CallbackQuery):
     if act in ("as", "zq") and not is_admin(cb.from_user.id):
         await cb.message.answer("Недостаточно прав.")
         return
+    if act == "nt" and not is_admin(cb.from_user.id):
+        await cb.message.answer("Недостаточно прав.")
+        return
     runner = {"as": show_assign, "st": show_stats, "ex": send_export, "rp": show_report_routes,
-              "zq": zip_ask}[act]
+              "zq": zip_ask, "nt": notes_routes}[act]
     await runner(cb.message, wb)
 
 
@@ -389,6 +394,8 @@ async def cmd_report(message: Message, command: CommandObject, state: FSMContext
 
 def report_kb(uid: int, r):
     rows = [[("🖼 Фото по маршруту", f"ph:{r['id']}")]]
+    if is_admin(uid):
+        rows.append([("📝 Примечания к маршруту", f"ntr:{r['id']}")])
     if r["closed_at"] and is_admin(uid):
         rows.append([("↩️ Открыть маршрут снова", f"rro:{r['id']}")])
     elif r["close_req_at"] and is_admin(uid):
@@ -1051,6 +1058,174 @@ async def zip_send(message: Message, wb_id: int):
         await message.answer(f"❌ Не удалось отправить архив: {h(str(e))}")
     finally:
         zipper.cleanup(tmp)
+
+
+# ------------------------------------------------------------ notes -------
+
+@router.message(F.text == A_NOTES, ADM)
+async def notes_menu(message: Message, state: FSMContext):
+    await state.clear()
+    n = len(N.pending())
+    if n:
+        await message.answer(f"🕓 Заметок водителей на утверждении: <b>{n}</b>",
+                             reply_markup=ikb([[("Посмотреть", "nq")]]))
+    await choose_date_or_run(message, "nt", notes_routes)
+
+
+async def notes_routes(message: Message, wb):
+    btns = [(f"№{r['route_no']}", f"ntr:{r['id']}") for r in S.routes_of(wb["id"])]
+    rows = [btns[i:i + 5] for i in range(0, len(btns), 5)]
+    await message.answer(f"📝 Примечания. Маршруты на {S.date_label(wb)} — выберите маршрут:", reply_markup=ikb(rows))
+
+
+@router.callback_query(F.data == "nq", ADM)
+async def cb_notes_pending(cb: CallbackQuery):
+    await cb.answer()
+    items = N.pending()
+    if not items:
+        await cb.message.answer("Заметок на утверждении нет.")
+        return
+    for n in items[:20]:
+        await cb.message.answer(f"📝 {h(S.driver_name(n['author_id']))}, маршрут №{h(n['route_no'] or '—')}, "
+                                f"{n['created_at'][:16]}\n📍 {h(note_target(n))}\n\n{n['text']}",
+                                reply_markup=ikb([[("✅ Утвердить", f"nok:{n['id']}"),
+                                                   ("❌ Отклонить", f"nno:{n['id']}")]]))
+
+
+def note_target(n) -> str:
+    if n["scope"] == "route":
+        return f"весь маршрут №{n['route_no']}"
+    p = db.q1("SELECT address, network FROM points WHERE code_1c=? ORDER BY id DESC LIMIT 1",
+              (n["point_key"][3:],)) if n["point_key"].startswith("1c:") else None
+    return f"{p['network']} — {p['address']}" if p else n["point_key"].split(":", 1)[1]
+
+
+@router.callback_query(F.data.startswith("ntr:"), ADM)
+async def cb_route_notes(cb: CallbackQuery):
+    rid = int(cb.data[4:])
+    r = S.route_with_wb(rid)
+    await cb.answer()
+    lines = [f"📝 <b>Примечания: маршрут №{h(r['route_no'])}, {S.fmt_date(r['work_date'])}</b>", ""]
+    rows = []
+    rn = N.for_route(r["route_no"], r["work_date"])
+    if rn:
+        lines.append("<b>К маршруту в целом:</b>")
+        for n in rn:
+            lines.append(f"• [{n['id']}] {n['text']} <i>({N.when(n)})</i>")
+            rows.append([(f"🗑 Удалить [{n['id']}]", f"ndl:{n['id']}")])
+    for p in db.q("SELECT * FROM points WHERE route_id=? ORDER BY seq", (rid,)):
+        pn = N.for_point(p, r["work_date"])
+        if not pn:
+            continue
+        lines.append(f"\n<b>{p['seq']}. {h(short(p['address'], 60))}</b>")
+        for n in pn:
+            who = "❗ логист" if n["author_role"] == "admin" else f"📝 {h(S.driver_name(n['author_id']))}"
+            lines.append(f"• [{n['id']}] {n['text']} <i>({who}, {N.when(n)})</i>")
+            rows.append([(f"🗑 Удалить [{n['id']}]", f"ndl:{n['id']}")])
+    if len(lines) == 2:
+        lines.append("Примечаний пока нет.")
+    rows.append([("➕ Примечание к маршруту", f"nar:{rid}"), ("➕ К адресу", f"npl:{rid}")])
+    await send_content(cb.bot, cb.message.chat.id, "\n".join(lines), reply_markup=ikb(rows))
+
+
+@router.callback_query(F.data.startswith("npl:"), ADM)
+async def cb_note_pick_point(cb: CallbackQuery):
+    rid = int(cb.data[4:])
+    await cb.answer()
+    rows = [[(f"{p['seq']}. {short(p['address'], 45)}", f"npp:{p['id']}")]
+            for p in db.q("SELECT * FROM points WHERE route_id=? ORDER BY seq", (rid,))]
+    await cb.message.answer("К какому адресу добавить примечание?", reply_markup=ikb(rows[:95]))
+
+
+@router.callback_query(F.data.startswith("nar:") | F.data.startswith("npp:"), ADM)
+async def cb_note_target(cb: CallbackQuery, state: FSMContext):
+    kind, oid = cb.data.split(":")
+    oid = int(oid)
+    if kind == "nar":
+        r = S.route_with_wb(oid)
+        target = f"весь маршрут №{h(r['route_no'])}"
+        await state.update_data(n_scope="route", n_key=None, n_route=r["route_no"], n_date=r["work_date"],
+                                n_rid=oid, n_pid=None)
+    else:
+        p = db.q1("SELECT * FROM points WHERE id=?", (oid,))
+        r = S.route_with_wb(p["route_id"])
+        target = f"адрес {h(p['address'])}"
+        await state.update_data(n_scope="point", n_key=N.point_key(p), n_route=r["route_no"], n_date=r["work_date"],
+                                n_rid=r["id"], n_pid=oid)
+    await cb.answer()
+    d = S.fmt_date(r["work_date"])
+    await cb.message.answer(f"❗ Примечание: {target}.\nКак долго оно действует?",
+                            reply_markup=ikb([[(f"📅 Только на {d}", "nw:d")],
+                                              [("♾ Постоянно (для всех будущих дат)", "nw:p")]]))
+
+
+@router.callback_query(F.data.startswith("nw:"), ADM)
+async def cb_note_when(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if "n_scope" not in data:
+        await cb.answer("Начните заново", show_alert=True)
+        return
+    await state.update_data(n_perm=cb.data == "nw:p")
+    await state.set_state(Adm.note_text)
+    await cb.answer()
+    await cb.message.answer("Напишите текст примечания — водитель увидит его в маршруте и при открытии точки:",
+                            reply_markup=CANCEL_KB)
+
+
+@router.message(Adm.note_text, F.text, NOT_MENU, ADM)
+async def note_text_save(message: Message, state: FSMContext, bot: Bot):
+    d = await state.get_data()
+    await state.clear()
+    N.add(d["n_scope"], message.html_text, message.from_user.id, "admin", "approved", point_key_=d["n_key"],
+          route_no=d["n_route"], work_date=None if d["n_perm"] else d["n_date"])
+    await message.answer("✅ Примечание добавлено.", reply_markup=ADMIN_KB)
+    r = S.route_with_wb(d["n_rid"])
+    if r["driver_id"] and not r["closed_at"] and not r["wb_closed_at"]:
+        where = f"маршруту №{h(r['route_no'])}"
+        if d["n_pid"]:
+            p = db.q1("SELECT address FROM points WHERE id=?", (d["n_pid"],))
+            where = f"адресу {h(p['address'])} (маршрут №{h(r['route_no'])})"
+        try:
+            await bot.send_message(r["driver_id"], f"❗ <b>Логист добавил важное примечание к {where}:</b>\n\n"
+                                                   f"{message.html_text}",
+                                   reply_markup=ikb([[("🗺 Открыть маршрут", f"r:{r['id']}")]]))
+        except Exception:
+            pass
+
+
+@router.callback_query(F.data.startswith("ndl:"), ADM)
+async def cb_note_delete(cb: CallbackQuery):
+    nid = int(cb.data[4:])
+    ok = N.decide(nid, "deleted", cb.from_user.id)
+    await cb.answer("Удалено" if ok else "Не найдено", show_alert=not ok)
+    if ok:
+        await cb.message.answer(f"🗑 Примечание [{nid}] удалено.")
+
+
+@router.callback_query(F.data.startswith("nok:") | F.data.startswith("nno:"), ADM)
+async def cb_note_decide(cb: CallbackQuery, bot: Bot):
+    kind, nid = cb.data.split(":")
+    nid = int(nid)
+    status = "approved" if kind == "nok" else "rejected"
+    if not N.decide(nid, status, cb.from_user.id, only_if="pending"):
+        await cb.answer("Заметка уже обработана", show_alert=True)
+        return
+    n = N.get(nid)
+    await cb.answer("Утверждено" if status == "approved" else "Отклонено")
+    try:
+        await cb.message.edit_reply_markup(
+            reply_markup=ikb([[("🗑 Удалить заметку", f"ndl:{nid}")]]) if status == "approved" else None)
+    except Exception:
+        pass
+    await cb.message.answer(("✅ Заметка утверждена — её увидят водители на этом адресе."
+                             if status == "approved" else "❌ Заметка отклонена."))
+    try:
+        await bot.send_message(n["author_id"], ("✅ Ваша заметка к адресу утверждена логистом и видна другим водителям."
+                                                if status == "approved" else
+                                                "❌ Логист не утвердил вашу заметку к адресу.")
+                               + f"\n\n{n['text']}")
+    except Exception:
+        pass
 
 
 # ------------------------------------------------------------ problem text

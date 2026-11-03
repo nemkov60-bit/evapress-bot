@@ -22,6 +22,7 @@ A_INSTR_ADD = "➕ Добавить инструкцию"
 A_USERS = "👥 Пользователи"
 A_INVITE = "🎟 Пригласить"
 A_PROBLEM_TEXT = "⚙️ Текст «Проблема»"
+A_NOTES = "📝 Примечания"
 
 CANCEL = "❌ Отмена"
 
@@ -44,7 +45,7 @@ ADMIN_KB = kb([
     [A_ZIP, A_MSG],
     [A_INSTR, A_INSTR_ADD],
     [A_USERS, A_INVITE],
-    [A_PROBLEM_TEXT],
+    [A_NOTES, A_PROBLEM_TEXT],
 ])
 CUSTOMER_KB = kb([[A_STATS, A_REPORT], [A_EXPORT]])
 CANCEL_KB = kb([[CANCEL]])
@@ -52,7 +53,7 @@ PROBLEM_KB = kb([[B_SEND_PROBLEM], [CANCEL]])
 
 DRIVER_BUTTONS = {B_START, B_MY_ROUTE, B_PROBLEM, B_INSTR}
 ADMIN_BUTTONS = {A_UPLOAD, A_ASSIGN, A_STATS, A_REPORT, A_EXPORT, A_CLOSE, A_ZIP, A_MSG, A_INSTR, A_INSTR_ADD,
-                 A_USERS, A_INVITE, A_PROBLEM_TEXT}
+                 A_USERS, A_INVITE, A_PROBLEM_TEXT, A_NOTES}
 
 
 def kb_for(role: str | None) -> ReplyKeyboardMarkup:
