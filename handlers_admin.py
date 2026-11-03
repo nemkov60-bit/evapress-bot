@@ -1,4 +1,4 @@
-"""Сценарии администратора (логиста)."""
+"""Сценарии администратора (логиста) и заказчика (наблюдателя)."""
 import asyncio
 from datetime import date
 from html import escape as h
@@ -8,16 +8,24 @@ from aiogram import Bot, F, Router
 from aiogram.filters import BaseFilter, Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, FSInputFile, InputMediaPhoto, Message
+from aiogram.types import CallbackQuery, FSInputFile, InputMediaPhoto, Message, ReplyKeyboardRemove
 
 import db
 import services as S
-from common import extract_content, is_admin, send_content, user_label
-from config import WB_DIR
-from keyboards import (A_ASSIGN, A_DRIVERS, A_EXPORT, A_INSTR, A_MSG, A_PROBLEM_TEXT, A_REPORT, A_STATS,
-                       A_UPLOAD, ADMIN_BUTTONS, ADMIN_KB, CANCEL, CANCEL_KB, ikb, short)
+import zipper
+from common import ROLE_NAMES, extract_content, is_admin, is_staff, role_of, send_content, user_label
+from config import ADMIN_IDS, WB_DIR
+from keyboards import (A_ASSIGN, A_CLOSE, A_EXPORT, A_INSTR, A_INSTR_ADD, A_INVITE, A_MSG, A_PROBLEM_TEXT,
+                       A_REPORT, A_STATS, A_UPLOAD, A_USERS, A_ZIP, ADMIN_BUTTONS, ADMIN_KB, CANCEL, CANCEL_KB,
+                       ikb, kb_for, short)
 
 NOT_MENU = ~F.text.in_(ADMIN_BUTTONS | {CANCEL})
+
+
+class IsStaff(BaseFilter):
+    """Администратор или заказчик — все, кто попадает в этот роутер."""
+    async def __call__(self, event) -> bool:
+        return is_staff(event.from_user.id)
 
 
 class IsAdmin(BaseFilter):
@@ -25,9 +33,11 @@ class IsAdmin(BaseFilter):
         return is_admin(event.from_user.id)
 
 
-router = Router(name="admin")
-router.message.filter(IsAdmin())
-router.callback_query.filter(IsAdmin())
+ADM = IsAdmin()   # фильтр для действий, доступных только администратору
+
+router = Router(name="staff")
+router.message.filter(IsStaff())
+router.callback_query.filter(IsStaff())
 
 
 class Adm(StatesGroup):
@@ -51,7 +61,21 @@ HELP = (
     "📖 <b>Инструкции</b> — добавить / изменить / удалить инструкции для водителей.\n"
     "✉️ <b>Сообщение водителям</b> — инструкция всем водителям на маршруте, всем водителям или конкретному.\n"
     "⚙️ <b>Текст «Проблема»</b> — памятка и контакты, которые видит водитель по кнопке «Проблема на адресе».\n"
+    "🔒 <b>Закрыть рейс</b> — закрывает все маршруты на дату: водители больше не могут закрывать точки, "
+    "бот присылает итоговый Excel.\n"
+    "🗜 <b>Сохранить .ZIP</b> — архив за дату: итоговый Excel и папки маршрутов с фото водителей. "
+    "Если архив больше 45 МБ, он делится на части (ограничение Telegram).\n"
+    "🎟 <b>Пригласить</b> — одноразовая ссылка-приглашение для водителя, заказчика или администратора "
+    "(действует 7 дней). Без приглашения в бот попасть нельзя.\n"
+    "👥 <b>Пользователи</b> — список пользователей, смена роли, удаление.\n"
     "/cancel — отменить текущее действие."
+)
+
+CUSTOMER_HELP = (
+    "<b>Справка</b>\n\n"
+    "📊 <b>Статистика</b> — /stats, /stats 04.11.2026, /stats 1 6 14\n"
+    "📑 <b>Отчёт</b> — /report 04.11.2026 14 или через кнопку; в отчёте есть кнопка «Фото по маршруту».\n"
+    "📤 <b>Выгрузить Excel</b> — /export или /export 04.11.2026."
 )
 
 
@@ -64,7 +88,7 @@ async def safe_edit(cb: CallbackQuery, text: str, markup=None):
 
 def date_picker(action: str):
     wbs = S.workbooks(10)
-    return ikb([[(S.fmt_date(w["work_date"]), f"wd:{action}:{w['id']}")] for w in wbs]), wbs
+    return ikb([[(S.date_label(w), f"wd:{action}:{w['id']}")] for w in wbs]), wbs
 
 
 async def choose_date_or_run(message: Message, action: str, runner):
@@ -79,34 +103,45 @@ async def choose_date_or_run(message: Message, action: str, runner):
 
 # ------------------------------------------------------------ common ------
 
+def my_kb(uid: int):
+    return kb_for(role_of(uid))
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("👋 Добро пожаловать, администратор!\n"
-                         "Загрузите Excel с маршрутами (просто отправьте файл в чат) или выберите действие в меню.\n"
-                         "Справка: /help", reply_markup=ADMIN_KB)
+    if is_admin(message.from_user.id):
+        await message.answer("👋 Добро пожаловать!\n"
+                             "Загрузите Excel с маршрутами (просто отправьте файл в чат) или выберите действие в меню.\n"
+                             "Справка: /help", reply_markup=ADMIN_KB)
+    else:
+        await message.answer("👋 Добро пожаловать!\n"
+                             "Здесь вы можете смотреть статистику, отчёты и выгружать Excel по маршрутам.\n"
+                             "Справка: /help", reply_markup=my_kb(message.from_user.id))
 
 
 @router.message(Command("myid"))
 async def cmd_myid(message: Message):
-    await message.answer(f"Ваш Telegram ID: <code>{message.from_user.id}</code> (администратор)")
+    await message.answer(f"Ваш Telegram ID: <code>{message.from_user.id}</code> "
+                         f"({ROLE_NAMES[role_of(message.from_user.id)].lower()})")
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message):
-    await message.answer(HELP, reply_markup=ADMIN_KB)
+    uid = message.from_user.id
+    await message.answer(HELP if is_admin(uid) else CUSTOMER_HELP, reply_markup=my_kb(uid))
 
 
 @router.message(Command("cancel"))
 @router.message(F.text == CANCEL)
 async def cmd_cancel(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("Отменено.", reply_markup=ADMIN_KB)
+    await message.answer("Отменено.", reply_markup=my_kb(message.from_user.id))
 
 
 # ------------------------------------------------------------ upload ------
 
-@router.message(F.text == A_UPLOAD)
+@router.message(F.text == A_UPLOAD, ADM)
 async def upload_hint(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Отправьте файл Excel (.xlsx) с маршрутами.\n"
@@ -114,7 +149,7 @@ async def upload_hint(message: Message, state: FSMContext):
                          "или укажите её в подписи к файлу.")
 
 
-@router.message(F.document)
+@router.message(F.document, ADM)
 async def upload_file(message: Message, state: FSMContext, bot: Bot):
     doc = message.document
     name = doc.file_name or "routes.xlsx"
@@ -146,7 +181,7 @@ async def route_state_doc(message: Message, state: FSMContext, bot: Bot):
         await msg_send(message, state, bot)
 
 
-@router.message(Adm.upload_date, F.text, NOT_MENU)
+@router.message(Adm.upload_date, F.text, NOT_MENU, ADM)
 async def upload_date(message: Message, state: FSMContext):
     d = S.parse_date(message.text)
     if not d:
@@ -187,13 +222,17 @@ async def cb_date(cb: CallbackQuery):
     if not wb:
         await cb.message.answer("Файл не найден.")
         return
-    runner = {"as": show_assign, "st": show_stats, "ex": send_export, "rp": show_report_routes}[act]
+    if act in ("as", "zq") and not is_admin(cb.from_user.id):
+        await cb.message.answer("Недостаточно прав.")
+        return
+    runner = {"as": show_assign, "st": show_stats, "ex": send_export, "rp": show_report_routes,
+              "zq": zip_ask}[act]
     await runner(cb.message, wb)
 
 
 # ------------------------------------------------------------ assign ------
 
-@router.message(F.text == A_ASSIGN)
+@router.message(F.text == A_ASSIGN, ADM)
 async def assign_menu(message: Message, state: FSMContext):
     await state.clear()
     await choose_date_or_run(message, "as", show_assign)
@@ -204,20 +243,23 @@ async def show_assign(message: Message, wb, edit_cb: CallbackQuery | None = None
     for r in S.routes_of(wb["id"]):
         c, t = S.route_counts(r["id"])
         rows.append([(f"№{r['route_no']} ({c}/{t}) — {short(S.driver_name(r['driver_id']), 28)}", f"ar:{r['id']}")])
-    text = f"🧭 <b>Назначение маршрутов на {S.fmt_date(wb['work_date'])}</b>\nВыберите маршрут:"
+    text = f"🧭 <b>Назначение маршрутов на {S.date_label(wb)}</b>\nВыберите маршрут:"
     if edit_cb:
         await safe_edit(edit_cb, text, ikb(rows))
     else:
         await message.answer(text, reply_markup=ikb(rows))
 
 
-@router.callback_query(F.data.startswith("ar:"))
+@router.callback_query(F.data.startswith("ar:"), ADM)
 async def cb_assign_route(cb: CallbackQuery):
     rid = int(cb.data[3:])
     r = S.route_with_wb(rid)
+    if r["wb_closed_at"]:
+        await cb.answer("Рейс на эту дату закрыт. Сначала откройте его снова.", show_alert=True)
+        return
     drv = S.drivers()
     if not drv:
-        await cb.answer("Нет зарегистрированных водителей. Попросите водителей нажать /start в боте.",
+        await cb.answer("Нет водителей. Пригласите их кнопкой «🎟 Пригласить».",
                         show_alert=True)
         return
     busy = {x["driver_id"]: x["route_no"] for x in db.q("SELECT driver_id, route_no FROM routes "
@@ -235,7 +277,7 @@ async def cb_assign_route(cb: CallbackQuery):
                         f"Сейчас: {h(S.driver_name(r['driver_id']))}\nВыберите водителя:", ikb(rows))
 
 
-@router.callback_query(F.data.startswith("ad:"))
+@router.callback_query(F.data.startswith("ad:"), ADM)
 async def cb_assign_driver(cb: CallbackQuery, bot: Bot):
     _, rid, uid = cb.data.split(":")
     rid, uid = int(rid), int(uid)
@@ -347,26 +389,38 @@ async def cmd_report(message: Message, command: CommandObject, state: FSMContext
 
 @router.callback_query(F.data.startswith("ph:"))
 async def cb_photos(cb: CallbackQuery, bot: Bot):
+    from handlers_driver import send_files
     rid = int(cb.data[3:])
-    pts = db.q("SELECT * FROM points WHERE route_id=? AND (photo_display IS NOT NULL OR photo_invoice IS NOT NULL "
-               "OR photo_poa IS NOT NULL) ORDER BY seq", (rid,))
     await cb.answer()
-    if not pts:
-        await cb.message.answer("По маршруту пока нет фотографий.")
-        return
-    for p in pts:
-        cap = (f"{p['seq']}. {p['network']} — {p['address']}\n"
+    sent = 0
+    for p in db.q("SELECT * FROM points WHERE route_id=? ORDER BY seq", (rid,)):
+        files = [(p[f], "photo", None) for f in ("photo_display", "photo_invoice", "photo_poa") if p[f]]
+        extras = S.extra_photos(p["id"])
+        n_extra = len(extras)
+        files += [(x["file_id"], x["file_type"], x["file_name"]) for x in extras]
+        probs = db.q("SELECT * FROM photos WHERE kind='problem' AND point_id=? ORDER BY id", (p["id"],))
+        if not files and not probs:
+            continue
+        cap = (f"📍 {p['seq']}. {h(p['network'])} — {h(p['address'])}\n"
                f"{'✅ закрыта ' + S.fmt_time(p['closed_at']) if p['status'] == 'closed' else '⬜ не закрыта'}"
-               f"{' · доверенность отсутствует' if p['poa_absent'] else ''}")
-        media = []
-        for f in ("photo_display", "photo_invoice", "photo_poa"):
-            if p[f]:
-                media.append(InputMediaPhoto(media=p[f], caption=None if media else cap[:1024]))
+               f"{' · доверенность отсутствует' if p['poa_absent'] else ''}"
+               + (f"\n📎 доп. фото: {n_extra}" if n_extra else "")
+               + (f"\n⚠️ фото к проблеме: {len(probs)}" if probs else ""))
+        await cb.message.answer(cap)
         try:
-            await bot.send_media_group(cb.message.chat.id, media)
+            await send_files(bot, cb.message.chat.id, files + [(x["file_id"], x["file_type"], x["file_name"])
+                                                                for x in probs])
         except Exception as e:  # noqa: BLE001
             await cb.message.answer(f"Не удалось отправить фото точки {p['seq']}: {h(str(e))}")
+        sent += 1
         await asyncio.sleep(0.4)
+    loose = db.q("SELECT * FROM photos WHERE kind='problem' AND route_id=? AND point_id IS NULL ORDER BY id", (rid,))
+    if loose:
+        await cb.message.answer(f"⚠️ Фото к проблемам без привязки к адресу: {len(loose)}")
+        await send_files(bot, cb.message.chat.id, [(x["file_id"], x["file_type"], x["file_name"]) for x in loose])
+        sent += 1
+    if not sent:
+        await cb.message.answer("По маршруту пока нет фотографий.")
 
 
 # ------------------------------------------------------------ export ------
@@ -398,10 +452,11 @@ async def send_export(message: Message, wb):
     for r in S.routes_of(wb["id"]):
         c, t = S.route_counts(r["id"])
         tc, tt = tc + c, tt + t
+    kind = "🔒 Итоговый Excel (рейс закрыт)" if wb["closed_at"] else "📤 Промежуточная выгрузка (рейс не закрыт)"
     await message.answer_document(FSInputFile(path, filename=wb["filename"]),
-                                  caption=f"📤 Выгрузка на {S.fmt_date(wb['work_date'])} "
-                                          f"(сформирована {db.now():%d.%m.%Y %H:%M}).\n"
-                                          f"Закрыто точек: {tc} из {tt}.")
+                                  caption=f"{kind} на {S.fmt_date(wb['work_date'])}, "
+                                          f"сформирована {db.now():%d.%m.%Y %H:%M}.\n"
+                                          f"Закрыто точек: {tc} из {tt}, не закрыто: {tt - tc}.")
 
 
 # ------------------------------------------------------------ instructions
@@ -412,22 +467,33 @@ def instr_list_markup():
     return ikb(rows)
 
 
-@router.message(F.text == A_INSTR)
+@router.message(F.text == A_INSTR, ADM)
 async def instr_menu(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("📖 Инструкции для водителей. Нажмите на инструкцию, чтобы просмотреть, "
                          "изменить или удалить её.", reply_markup=instr_list_markup())
 
 
-@router.callback_query(F.data == "ia")
+@router.callback_query(F.data == "ia", ADM)
 async def cb_instr_add(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await start_instr_add(cb.message, state)
+
+
+@router.message(F.text == A_INSTR_ADD, ADM)
+async def instr_add_btn(message: Message, state: FSMContext):
+    await state.clear()
+    await start_instr_add(message, state)
+
+
+async def start_instr_add(message: Message, state: FSMContext):
     await state.set_state(Adm.instr_title)
     await state.update_data(instr_id=None)
-    await cb.answer()
-    await cb.message.answer("Введите <b>заголовок</b> инструкции:", reply_markup=CANCEL_KB)
+    await message.answer("➕ <b>Новая инструкция для водителей</b>\n\nВведите <b>заголовок</b> инструкции:",
+                         reply_markup=CANCEL_KB)
 
 
-@router.callback_query(F.data.startswith("iv:"))
+@router.callback_query(F.data.startswith("iv:"), ADM)
 async def cb_instr_view(cb: CallbackQuery, bot: Bot):
     r = db.q1("SELECT * FROM instructions WHERE id=?", (int(cb.data[3:]),))
     await cb.answer()
@@ -439,7 +505,7 @@ async def cb_instr_view(cb: CallbackQuery, bot: Bot):
                        reply_markup=ikb([[("✏️ Изменить", f"ie:{r['id']}"), ("🗑 Удалить", f"idl:{r['id']}")]]))
 
 
-@router.callback_query(F.data.startswith("ie:"))
+@router.callback_query(F.data.startswith("ie:"), ADM)
 async def cb_instr_edit(cb: CallbackQuery, state: FSMContext):
     iid = int(cb.data[3:])
     await state.set_state(Adm.instr_title)
@@ -449,7 +515,7 @@ async def cb_instr_edit(cb: CallbackQuery, state: FSMContext):
                             reply_markup=CANCEL_KB)
 
 
-@router.message(Adm.instr_title, F.text, NOT_MENU)
+@router.message(Adm.instr_title, F.text, NOT_MENU, ADM)
 async def instr_title(message: Message, state: FSMContext):
     await state.update_data(title=message.text.strip())
     await state.set_state(Adm.instr_body)
@@ -457,7 +523,7 @@ async def instr_title(message: Message, state: FSMContext):
                          "(текст — в подписи).")
 
 
-@router.message(Adm.instr_body, NOT_MENU)
+@router.message(Adm.instr_body, NOT_MENU, ADM)
 async def instr_body(message: Message, state: FSMContext):
     text, file_id, file_type = extract_content(message)
     if not text and not file_id:
@@ -484,7 +550,7 @@ async def instr_body(message: Message, state: FSMContext):
     await message.answer("📖 Инструкции:", reply_markup=instr_list_markup())
 
 
-@router.callback_query(F.data.startswith("idl:"))
+@router.callback_query(F.data.startswith("idl:"), ADM)
 async def cb_instr_del(cb: CallbackQuery):
     iid = int(cb.data[4:])
     await cb.answer()
@@ -492,7 +558,7 @@ async def cb_instr_del(cb: CallbackQuery):
                                                                       ("Отмена", "noop")]]))
 
 
-@router.callback_query(F.data.startswith("idc:"))
+@router.callback_query(F.data.startswith("idc:"), ADM)
 async def cb_instr_del_confirm(cb: CallbackQuery):
     db.x("DELETE FROM instructions WHERE id=?", (int(cb.data[4:]),))
     await cb.answer("Удалено")
@@ -518,7 +584,7 @@ def active_driver_ids() -> list[int]:
                                          "AND driver_id IS NOT NULL", (wb["id"],))]
 
 
-@router.message(F.text == A_MSG)
+@router.message(F.text == A_MSG, ADM)
 async def msg_menu(message: Message, state: FSMContext):
     await state.clear()
     rows = [[("🚚 Всем водителям на маршрутах (текущая дата)", "mt:active")],
@@ -529,7 +595,7 @@ async def msg_menu(message: Message, state: FSMContext):
     await message.answer("✉️ Кому отправить инструкцию / сообщение?", reply_markup=ikb(rows))
 
 
-@router.callback_query(F.data.startswith("mt:") | F.data.startswith("ans:"))
+@router.callback_query(F.data.startswith("mt:") | F.data.startswith("ans:"), ADM)
 async def cb_msg_target(cb: CallbackQuery, state: FSMContext):
     target = cb.data.split(":", 1)[1]
     if target == "active":
@@ -549,7 +615,7 @@ async def cb_msg_target(cb: CallbackQuery, state: FSMContext):
                             reply_markup=CANCEL_KB)
 
 
-@router.message(Adm.msg, NOT_MENU)
+@router.message(Adm.msg, NOT_MENU, ADM)
 async def msg_send(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     await state.clear()
@@ -570,51 +636,320 @@ async def msg_send(message: Message, state: FSMContext, bot: Bot):
     await message.answer(f"✅ Доставлено: {ok} из {len(data['targets'])}.", reply_markup=ADMIN_KB)
 
 
-# ------------------------------------------------------------ drivers -----
+# ------------------------------------------------------------ users -------
 
-@router.message(F.text == A_DRIVERS)
-async def drivers_menu(message: Message, state: FSMContext):
+ROLE_ICON = {"admin": "👑", "customer": "👁", "driver": "🚚"}
+
+
+@router.message(F.text == A_USERS, ADM)
+async def users_menu(message: Message, state: FSMContext):
     await state.clear()
-    drv = S.drivers()
-    if not drv:
-        await message.answer("Водителей пока нет. Водитель регистрируется сам: открывает бота и нажимает /start.")
-        return
+    groups = S.users_by_role()
     act = {}
     wb = S.latest_workbook()
     if wb:
         for r in db.q("SELECT driver_id, route_no FROM routes WHERE workbook_id=? AND driver_id IS NOT NULL",
                       (wb["id"],)):
             act.setdefault(r["driver_id"], []).append(r["route_no"])
-    lines = [f"👥 <b>Водители ({len(drv)})</b>" + (f" · маршруты на {S.fmt_date(wb['work_date'])}" if wb else ""), ""]
-    for d in drv:
-        lines.append(f"• {user_label(d['tg_id'])} — "
-                     + (f"№{', №'.join(act[d['tg_id']])}" if d["tg_id"] in act else "без маршрута"))
-    rows = [[(f"🗑 {short(d['full_name'], 45)}", f"dd:{d['tg_id']}")] for d in drv]
+    lines = ["👥 <b>Пользователи</b>", ""]
+    env_admins = sorted(ADMIN_IDS)
+    titles = {"admin": "Администраторы", "customer": "Заказчики", "driver": "Водители"}
+    for role in ("admin", "customer", "driver"):
+        people = groups.get(role, [])
+        count = len(people) + (len(env_admins) if role == "admin" else 0)
+        lines.append(f"{ROLE_ICON[role]} <b>{titles[role]} ({count})</b>")
+        if role == "admin":
+            for a in env_admins:
+                known = db.q1("SELECT 1 FROM users WHERE tg_id=?", (a,))
+                lines.append(f"• {user_label(a) if known else f'id {a}'} (из настроек ADMIN_IDS)")
+        for u in people:
+            extra = ""
+            if role == "driver":
+                extra = " — " + (f"№{', №'.join(act[u['tg_id']])}" if u["tg_id"] in act else "без маршрута")
+            lines.append(f"• {user_label(u['tg_id'])}{extra}")
+        lines.append("")
+    rows = []
+    for role in ("admin", "customer", "driver"):
+        for u in groups.get(role, []):
+            rows.append([(f"{ROLE_ICON[role]} {short(u['full_name'], 45)}", f"u:{u['tg_id']}")])
+    rows.append([("🎟 Пригласить", "inv"), ("📋 Активные приглашения", "invl")])
     await send_content(message.bot, message.chat.id, "\n".join(lines))
-    await message.answer("Чтобы удалить водителя, нажмите на него:", reply_markup=ikb(rows))
+    await message.answer("Нажмите на пользователя, чтобы сменить роль или удалить его:", reply_markup=ikb(rows))
 
 
-@router.callback_query(F.data.startswith("dd:"))
+@router.callback_query(F.data.startswith("u:"), ADM)
+async def cb_user(cb: CallbackQuery):
+    uid = int(cb.data[2:])
+    u = db.q1("SELECT * FROM users WHERE tg_id=? AND active=1", (uid,))
+    await cb.answer()
+    if not u:
+        await cb.message.answer("Пользователь не найден.")
+        return
+    role = u["role"] or "driver"
+    rows = [[(f"→ {ROLE_NAMES[r]}", f"ur:{uid}:{r}") for r in ("driver", "customer", "admin") if r != role]]
+    rows.append([("🗑 Удалить", f"dd:{uid}"), ("Отмена", "noop")])
+    note = "\n\n⚠️ Это вы. Изменить свою роль или удалить себя нельзя." if uid == cb.from_user.id else ""
+    if uid in ADMIN_IDS:
+        note += "\nℹ️ Этот ID указан в ADMIN_IDS — он остаётся администратором при любой роли здесь."
+    await cb.message.answer(f"{ROLE_ICON[role]} {user_label(uid)}\nРоль: <b>{ROLE_NAMES[role]}</b>{note}",
+                            reply_markup=None if uid == cb.from_user.id else ikb(rows))
+
+
+def _release_open_routes(uid: int) -> None:
+    db.x("UPDATE routes SET driver_id=NULL WHERE driver_id=? AND workbook_id IN "
+         "(SELECT id FROM workbooks WHERE closed_at IS NULL)", (uid,))
+
+
+@router.callback_query(F.data.startswith("ur:"), ADM)
+async def cb_user_role(cb: CallbackQuery, bot: Bot):
+    _, uid, role = cb.data.split(":")
+    uid = int(uid)
+    if uid == cb.from_user.id or role not in ROLE_NAMES:
+        await cb.answer("Нельзя", show_alert=True)
+        return
+    db.x("UPDATE users SET role=? WHERE tg_id=?", (role, uid))
+    if role != "driver":
+        _release_open_routes(uid)
+    await cb.answer("Роль изменена")
+    await safe_edit(cb, f"✅ {user_label(uid)}: роль изменена на <b>{ROLE_NAMES[role]}</b>.")
+    try:
+        await bot.send_message(uid, f"ℹ️ Ваша роль в боте изменена: <b>{ROLE_NAMES[role]}</b>.",
+                               reply_markup=kb_for(role))
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("dd:"), ADM)
 async def cb_driver_del(cb: CallbackQuery):
     uid = int(cb.data[3:])
     await cb.answer()
-    await cb.message.answer(f"Удалить водителя {user_label(uid)}? Назначенные ему маршруты будут сняты.",
+    if uid == cb.from_user.id:
+        await cb.message.answer("Удалить себя нельзя.")
+        return
+    await cb.message.answer(f"Удалить пользователя {user_label(uid)}? Он потеряет доступ к боту, "
+                            f"назначенные ему маршруты в открытых рейсах будут сняты.",
                             reply_markup=ikb([[("🗑 Да", f"ddc:{uid}"), ("Отмена", "noop")]]))
 
 
-@router.callback_query(F.data.startswith("ddc:"))
-async def cb_driver_del_confirm(cb: CallbackQuery):
+@router.callback_query(F.data.startswith("ddc:"), ADM)
+async def cb_driver_del_confirm(cb: CallbackQuery, bot: Bot):
     uid = int(cb.data[4:])
     db.x("UPDATE users SET active=0 WHERE tg_id=?", (uid,))
-    db.x("UPDATE routes SET driver_id=NULL WHERE driver_id=? AND id IN (SELECT r.id FROM routes r JOIN points p "
-         "ON p.route_id=r.id GROUP BY r.id HAVING SUM(p.status!='closed')>0)", (uid,))
+    _release_open_routes(uid)
     await cb.answer("Удалён")
-    await safe_edit(cb, "🗑 Водитель удалён. Для повторной регистрации ему нужно нажать /start.")
+    await safe_edit(cb, "🗑 Пользователь удалён. Чтобы вернуть доступ, отправьте ему новое приглашение.")
+    try:
+        await bot.send_message(uid, "🔒 Ваш доступ к боту EVA Press закрыт администратором.",
+                               reply_markup=ReplyKeyboardRemove())
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------ invites -----
+
+@router.message(F.text == A_INVITE, ADM)
+async def invite_menu(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("🎟 Кого пригласить? Бот создаст одноразовую ссылку, действующую "
+                         f"{S.INVITE_DAYS} дней. Перешлите её человеку.",
+                         reply_markup=ikb([[("🚚 Водителя", "invc:driver")],
+                                           [("👁 Заказчика (только просмотр)", "invc:customer")],
+                                           [("👑 Администратора", "invc:admin")],
+                                           [("📋 Активные приглашения", "invl")]]))
+
+
+@router.callback_query(F.data == "inv", ADM)
+async def cb_invite_menu(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await invite_menu(cb.message, state)
+
+
+@router.callback_query(F.data.startswith("invc:"), ADM)
+async def cb_invite_create(cb: CallbackQuery, bot: Bot):
+    role = cb.data.split(":")[1]
+    if role not in ROLE_NAMES:
+        await cb.answer()
+        return
+    code = S.create_invite(role, cb.from_user.id)
+    me = await bot.me()
+    link = f"https://t.me/{me.username}?start=inv_{code}"
+    await cb.answer("Приглашение создано")
+    await cb.message.answer(
+        f"🎟 Приглашение: <b>{ROLE_NAMES[role]}</b>\n"
+        f"Одноразовое, действует {S.INVITE_DAYS} дней.\n\n"
+        f"Перешлите человеку это сообщение или ссылку:\n{link}",
+        reply_markup=ikb([[("🚫 Отозвать", f"ivr:{code}")]]))
+
+
+@router.callback_query(F.data == "invl", ADM)
+async def cb_invite_list(cb: CallbackQuery):
+    await cb.answer()
+    inv = S.active_invites()
+    if not inv:
+        await cb.message.answer("Активных приглашений нет.")
+        return
+    rows = [[(f"🚫 {ROLE_NAMES.get(i['role'], i['role'])} · до {i['expires_at'][8:10]}.{i['expires_at'][5:7]}",
+              f"ivr:{i['code']}")] for i in inv[:30]]
+    await cb.message.answer(f"📋 Активные приглашения ({len(inv)}). Нажмите, чтобы отозвать:", reply_markup=ikb(rows))
+
+
+@router.callback_query(F.data.startswith("ivr:"), ADM)
+async def cb_invite_revoke(cb: CallbackQuery):
+    n = db.xc("UPDATE invites SET revoked=1 WHERE code=? AND used_by IS NULL", (cb.data[4:],))
+    await cb.answer("Отозвано" if n else "Уже использовано или отозвано", show_alert=not n)
+    if n:
+        await safe_edit(cb, "🚫 Приглашение отозвано.")
+
+
+# ------------------------------------------------------------ close day ---
+
+@router.message(F.text == A_CLOSE, ADM)
+async def close_menu(message: Message, state: FSMContext):
+    await state.clear()
+    wbs = [w for w in S.workbooks(10) if not w["closed_at"]]
+    if not wbs:
+        await message.answer("Нет открытых рейсов. Все загруженные даты уже закрыты.")
+        return
+    await message.answer("🔒 Какой рейс закрыть?",
+                         reply_markup=ikb([[(f"🔒 Закрыть рейс {S.fmt_date(w['work_date'])}", f"cl:{w['id']}")]
+                                           for w in wbs]))
+
+
+@router.callback_query(F.data.startswith("cl:"), ADM)
+async def cb_close_ask(cb: CallbackQuery):
+    wb = db.q1("SELECT * FROM workbooks WHERE id=?", (int(cb.data[3:]),))
+    await cb.answer()
+    if wb["closed_at"]:
+        await cb.message.answer(f"Рейс {S.fmt_date(wb['work_date'])} уже закрыт.")
+        return
+    c, t = S.wb_totals(wb["id"])
+    await cb.message.answer(
+        f"Закрыть рейс <b>{S.fmt_date(wb['work_date'])}</b>?\n\n"
+        f"✅ Закрыто точек: <b>{c}</b>\n❌ Не закрыто: <b>{t - c}</b> (в Excel будет 0)\n\n"
+        f"После закрытия водители не смогут закрывать точки на эту дату. Рейс можно будет открыть снова.",
+        reply_markup=ikb([[(f"✅ Закрыть рейс {S.fmt_date(wb['work_date'])}", f"clc:{wb['id']}")],
+                          [("Отмена", "noop")]]))
+
+
+async def do_close(message: Message, wb_id: int, admin_id: int, bot: Bot) -> None:
+    if not S.close_workbook(wb_id, admin_id):
+        await message.answer("Рейс уже закрыт.")
+    wb = db.q1("SELECT * FROM workbooks WHERE id=?", (wb_id,))
+    for r in db.q("SELECT DISTINCT driver_id FROM routes WHERE workbook_id=? AND driver_id IS NOT NULL", (wb_id,)):
+        try:
+            await bot.send_message(r["driver_id"], f"🔒 Рейс на {S.fmt_date(wb['work_date'])} закрыт "
+                                                   f"администратором. Спасибо за работу!")
+        except Exception:
+            pass
+    await send_content(bot, message.chat.id, S.report_all_text(wb))
+    await send_export(message, wb)
+
+
+@router.callback_query(F.data.startswith("clc:"), ADM)
+async def cb_close_confirm(cb: CallbackQuery, bot: Bot):
+    wb_id = int(cb.data[4:])
+    await cb.answer("Рейс закрыт")
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await do_close(cb.message, wb_id, cb.from_user.id, bot)
+    await cb.message.answer("Что дальше?", reply_markup=ikb([[("🗜 Сохранить .ZIP", f"zp:{wb_id}")],
+                                                             [("↩️ Открыть рейс снова", f"ro:{wb_id}")]]))
+
+
+@router.callback_query(F.data.startswith("ro:"), ADM)
+async def cb_reopen(cb: CallbackQuery):
+    wb_id = int(cb.data[3:])
+    S.reopen_workbook(wb_id)
+    wb = db.q1("SELECT * FROM workbooks WHERE id=?", (wb_id,))
+    await cb.answer("Рейс открыт")
+    await safe_edit(cb, f"↩️ Рейс {S.fmt_date(wb['work_date'])} снова открыт: водители могут закрывать точки.")
+
+
+# ------------------------------------------------------------ zip ---------
+
+@router.message(F.text == A_ZIP, ADM)
+async def zip_menu(message: Message, state: FSMContext):
+    await state.clear()
+    await choose_date_or_run(message, "zq", zip_ask)
+
+
+async def zip_ask(message: Message, wb):
+    if wb["closed_at"]:
+        await zip_send(message, wb["id"])
+        return
+    d = S.fmt_date(wb["work_date"])
+    await message.answer(f"Рейс {d} ещё не закрыт. Закрыть его и сохранить ZIP?",
+                         reply_markup=ikb([[(f"🔒 Закрыть рейс {d} и сохранить ZIP", f"clz:{wb['id']}")],
+                                           [("🗜 Сохранить без закрытия", f"zp:{wb['id']}")],
+                                           [("Отмена", "noop")]]))
+
+
+@router.callback_query(F.data.startswith("clz:"), ADM)
+async def cb_close_and_zip(cb: CallbackQuery, bot: Bot):
+    wb_id = int(cb.data[4:])
+    await cb.answer("Рейс закрыт")
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await do_close(cb.message, wb_id, cb.from_user.id, bot)
+    await zip_send(cb.message, wb_id)
+
+
+@router.callback_query(F.data.startswith("zp:"), ADM)
+async def cb_zip(cb: CallbackQuery):
+    await cb.answer()
+    await zip_send(cb.message, int(cb.data[3:]))
+
+
+async def zip_send(message: Message, wb_id: int):
+    if zipper.is_busy():
+        await message.answer("⏳ Уже собирается другой архив, попробуйте через пару минут.")
+        return
+    wb = db.q1("SELECT * FROM workbooks WHERE id=?", (wb_id,))
+    status = await message.answer(f"⏳ Собираю архив {zipper.zip_base_name(wb)}.zip: скачиваю фото…")
+    last = {"t": 0.0}
+
+    async def progress(done: int, total: int):
+        now = asyncio.get_running_loop().time()
+        if now - last["t"] > 5 or done == total:
+            last["t"] = now
+            try:
+                await status.edit_text(f"⏳ Собираю архив {zipper.zip_base_name(wb)}.zip: фото {done} из {total}…")
+            except Exception:
+                pass
+
+    try:
+        parts, tmp, n_photos, failed = await zipper.build_zip(message.bot, wb_id, progress)
+    except Exception as e:  # noqa: BLE001
+        await message.answer(f"❌ Не удалось собрать архив: {h(str(e))}")
+        return
+    try:
+        for i, p in enumerate(parts, 1):
+            cap = (f"🗜 {S.fmt_date(wb['work_date'])}"
+                   + ("" if len(parts) == 1 else f" — часть {i} из {len(parts)}")
+                   + (f"\nИтоговый Excel и папки маршрутов, фото: {n_photos}" if i == 1 else ""))
+            await message.bot.send_document(message.chat.id, FSInputFile(p, filename=p.name), caption=cap,
+                                            request_timeout=600)
+        if failed:
+            await message.answer(f"⚠️ Не удалось скачать {len(failed)} фото — список в файле "
+                                 f"«не_удалось_скачать.txt» внутри архива.")
+        try:
+            await status.edit_text(f"✅ Архив {zipper.zip_base_name(wb)} готов"
+                                   + (f" ({len(parts)} части)" if len(parts) > 1 else "") + ".")
+        except Exception:
+            pass
+    except Exception as e:  # noqa: BLE001
+        await message.answer(f"❌ Не удалось отправить архив: {h(str(e))}")
+    finally:
+        zipper.cleanup(tmp)
 
 
 # ------------------------------------------------------------ problem text
 
-@router.message(F.text == A_PROBLEM_TEXT)
+@router.message(F.text == A_PROBLEM_TEXT, ADM)
 async def problem_text_menu(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Текущая памятка, которую видит водитель по кнопке «⚠️ Проблема на адресе»:")
@@ -622,7 +957,7 @@ async def problem_text_menu(message: Message, state: FSMContext):
                          reply_markup=ikb([[("✏️ Изменить", "pe")]]))
 
 
-@router.callback_query(F.data == "pe")
+@router.callback_query(F.data == "pe", ADM)
 async def cb_problem_edit(cb: CallbackQuery, state: FSMContext):
     await state.set_state(Adm.problem_text)
     await cb.answer()
@@ -630,13 +965,18 @@ async def cb_problem_edit(cb: CallbackQuery, state: FSMContext):
                             reply_markup=CANCEL_KB)
 
 
-@router.message(Adm.problem_text, F.text, NOT_MENU)
+@router.message(Adm.problem_text, F.text, NOT_MENU, ADM)
 async def problem_text_save(message: Message, state: FSMContext):
     db.set_setting("problem_help", message.html_text)
     await state.clear()
     await message.answer("✅ Памятка обновлена.", reply_markup=ADMIN_KB)
 
 
+@router.callback_query()
+async def staff_cb_fallback(cb: CallbackQuery):
+    await cb.answer("Недостаточно прав", show_alert=True)
+
+
 @router.message()
-async def admin_fallback(message: Message):
-    await message.answer("Выберите действие в меню 👇 (/help — справка)", reply_markup=ADMIN_KB)
+async def staff_fallback(message: Message):
+    await message.answer("Выберите действие в меню 👇 (/help — справка)", reply_markup=my_kb(message.from_user.id))

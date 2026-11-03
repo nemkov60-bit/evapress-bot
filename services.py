@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import secrets
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from html import escape as h
@@ -9,7 +10,7 @@ from pathlib import Path
 
 import db
 import excel
-from config import EXPORT_DIR, WRITE_PROBLEMS_TO_COMMENTS, DRIVER_ROUTE_DAYS
+from config import ADMIN_IDS, EXPORT_DIR, WRITE_PROBLEMS_TO_COMMENTS, DRIVER_ROUTE_DAYS
 
 DEFAULT_PROBLEM_HELP = (
     "⚠️ <b>Нестандартная ситуация на адресе</b>\n\n"
@@ -60,7 +61,69 @@ def driver_name(uid: int | None) -> str:
 
 
 def drivers() -> list:
-    return db.q("SELECT * FROM users WHERE active=1 ORDER BY full_name")
+    return [u for u in db.q("SELECT * FROM users WHERE active=1 AND COALESCE(role,'driver')='driver' "
+                            "ORDER BY full_name") if u["tg_id"] not in ADMIN_IDS]
+
+
+def users_by_role() -> dict[str, list]:
+    """Пользователи из базы по ролям (администраторы из ADMIN_IDS — отдельно, в handlers)."""
+    res = {"admin": [], "customer": [], "driver": []}
+    for u in db.q("SELECT * FROM users WHERE active=1 ORDER BY full_name"):
+        if u["tg_id"] in ADMIN_IDS:
+            continue
+        res.setdefault(u["role"] or "driver", []).append(u)
+    return res
+
+
+# ------------------------------------------------------------- invites -----
+
+INVITE_DAYS = 7
+
+
+def create_invite(role: str, admin_id: int) -> str:
+    code = secrets.token_urlsafe(9)
+    expires = (db.now() + timedelta(days=INVITE_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+    db.x("INSERT INTO invites(code, role, created_by, created_at, expires_at) VALUES(?,?,?,?,?)",
+         (code, role, admin_id, db.now_s(), expires))
+    return code
+
+
+def check_invite(code: str | None):
+    if not code:
+        return None
+    return db.q1("SELECT * FROM invites WHERE code=? AND used_by IS NULL AND revoked=0 AND expires_at>?",
+                 (code, db.now_s()))
+
+
+def use_invite(code: str, uid: int) -> bool:
+    return db.xc("UPDATE invites SET used_by=?, used_at=? WHERE code=? AND used_by IS NULL AND revoked=0 "
+                 "AND expires_at>?", (uid, db.now_s(), code, db.now_s())) == 1
+
+
+def active_invites() -> list:
+    return db.q("SELECT * FROM invites WHERE used_by IS NULL AND revoked=0 AND expires_at>? ORDER BY created_at DESC",
+                (db.now_s(),))
+
+
+# ------------------------------------------------------------- close day ---
+
+def close_workbook(wb_id: int, admin_id: int) -> bool:
+    return db.xc("UPDATE workbooks SET closed_at=?, closed_by=? WHERE id=? AND closed_at IS NULL",
+                 (db.now_s(), admin_id, wb_id)) == 1
+
+
+def reopen_workbook(wb_id: int) -> None:
+    db.x("UPDATE workbooks SET closed_at=NULL, closed_by=NULL WHERE id=?", (wb_id,))
+
+
+def wb_totals(wb_id: int) -> tuple[int, int]:
+    r = db.q1("SELECT COUNT(*) t, SUM(p.status='closed') c FROM points p JOIN routes r ON r.id=p.route_id "
+              "WHERE r.workbook_id=?", (wb_id,))
+    return r["c"] or 0, r["t"] or 0
+
+
+def date_label(wb) -> str:
+    return fmt_date(wb["work_date"]) + (" 🔒" if wb["closed_at"] else "")
 
 
 # ------------------------------------------------------------- import ------
@@ -117,13 +180,31 @@ def import_workbook(path: Path, filename: str, work_date: date, admin_id: int) -
             total_points += 1
     # перепривязываем проблемы к новым id точек
     for old_rid, sheet in old_route_sheet.items():
-        for pr in db.q("SELECT id, point_id FROM problems WHERE route_id=?", (old_rid,)):
-            new_pid, new_rid = id_map.get(pr["point_id"], (None, new_route_by_sheet.get(sheet)))
-            db.x("UPDATE problems SET point_id=?, route_id=? WHERE id=?", (new_pid, new_rid, pr["id"]))
+        for table in ("problems", "photos"):
+            for pr in db.q(f"SELECT id, point_id FROM {table} WHERE route_id=?", (old_rid,)):
+                new_pid, new_rid = id_map.get(pr["point_id"], (None, new_route_by_sheet.get(sheet)))
+                db.x(f"UPDATE {table} SET point_id=?, route_id=? WHERE id=?", (new_pid, new_rid, pr["id"]))
     return {
         "date": iso, "replaced": bool(old_wb), "routes": [(r.route_no, len(r.points)) for r in parsed],
         "points": total_points, "kept_closed": kept_closed,
     }
+
+
+# ------------------------------------------------------------- photos ------
+
+def add_photo(kind: str, file_id: str, file_type: str, driver_id: int, point_id=None, route_id=None,
+              problem_id=None, file_name: str | None = None) -> int:
+    return db.x("INSERT INTO photos(kind, point_id, route_id, problem_id, driver_id, file_id, file_type, file_name,"
+                " created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (kind, point_id, route_id, problem_id, driver_id, file_id, file_type, file_name, db.now_s()))
+
+
+def extra_photos(point_id: int) -> list:
+    return db.q("SELECT * FROM photos WHERE kind='extra' AND point_id=? ORDER BY id", (point_id,))
+
+
+def problem_photos(problem_id: int) -> list:
+    return db.q("SELECT * FROM photos WHERE kind='problem' AND problem_id=? ORDER BY id", (problem_id,))
 
 
 # ------------------------------------------------------------- export ------
@@ -151,7 +232,10 @@ def export_workbook(wb_id: int) -> Path:
             comment = None
             if WRITE_PROBLEMS_TO_COMMENTS and probs.get(p["id"]):
                 parts = [p["orig_comment"]] if p["orig_comment"] else []
-                parts += [f'{fmt_time(pr["created_at"])} {pr["text"] or "фото"}'.strip() for pr in probs[p["id"]]]
+                for pr in probs[p["id"]]:
+                    n = len(problem_photos(pr["id"]))
+                    parts.append(f'{fmt_time(pr["created_at"])} {pr["text"] or ""}'.strip()
+                                 + (f" (фото: {n})" if n else ""))
                 comment = "; ".join(parts)
             rows[p["row_idx"]] = (tk, comment)
         updates[r["sheet_name"]] = {"tk_col": r["tk_col"], "comment_col": r["comment_col"], "rows": rows}
@@ -193,7 +277,8 @@ def route_counts(route_id: int) -> tuple[int, int]:
 
 
 def route_with_wb(route_id: int):
-    return db.q1("SELECT r.*, w.work_date FROM routes r JOIN workbooks w ON w.id=r.workbook_id WHERE r.id=?",
+    return db.q1("SELECT r.*, w.work_date, w.closed_at AS wb_closed_at FROM routes r "
+                 "JOIN workbooks w ON w.id=r.workbook_id WHERE r.id=?",
                  (route_id,))
 
 
@@ -201,7 +286,7 @@ def driver_routes(uid: int) -> list:
     """Маршруты водителя: сегодняшние + незавершённые за последние N дней."""
     since = (db.now().date() - timedelta(days=DRIVER_ROUTE_DAYS)).isoformat()
     rows = db.q("SELECT r.*, w.work_date FROM routes r JOIN workbooks w ON w.id=r.workbook_id "
-                "WHERE r.driver_id=? AND w.work_date>=? ORDER BY w.work_date DESC", (uid, since))
+                "WHERE r.driver_id=? AND w.work_date>=? AND w.closed_at IS NULL ORDER BY w.work_date DESC", (uid, since))
     today = db.now().date().isoformat()
     res = []
     for r in rows:
@@ -239,7 +324,8 @@ def stats_text(wb, route_nos: list[str] | None = None) -> str:
         routes = [r for r in routes if r["route_no"].lower() in wanted]
         if not routes:
             return f"Маршруты {', '.join(route_nos)} не найдены в файле на {fmt_date(wb['work_date'])}."
-    lines = [f"📊 <b>Статистика на {fmt_date(wb['work_date'])}</b>", ""]
+    lines = [f"📊 <b>Статистика на {fmt_date(wb['work_date'])}</b>"
+             + (" · рейс закрыт 🔒" if wb["closed_at"] else ""), ""]
     tc = tt = 0
     for r in routes:
         c, t = route_counts(r["id"])
@@ -276,14 +362,17 @@ def report_text(wb, route) -> str:
     if probs:
         lines.append(f"\n<b>Проблемы на адресах ({len(probs)}):</b>")
         for pr in probs:
+            n = len(problem_photos(pr["id"]))
             lines.append(f"• {fmt_time(pr['created_at'])} {h(pr['address'] or 'без точки')} — "
-                         f"{h(pr['text'] or '(фото)')} ({h(driver_name(pr['driver_id']))})")
+                         f"{h(pr['text'] or '(без текста)')}" + (f" 📷{n}" if n else "")
+                         + f" ({h(driver_name(pr['driver_id']))})")
     return "\n".join(lines)
 
 
 def report_all_text(wb) -> str:
     routes = routes_of(wb["id"])
-    lines = [f"📑 <b>Отчёт на {fmt_date(wb['work_date'])} по всем маршрутам</b>", ""]
+    lines = [f"📑 <b>Отчёт на {fmt_date(wb['work_date'])} по всем маршрутам</b>"
+             + (" · рейс закрыт 🔒" if wb["closed_at"] else ""), ""]
     tc = tt = 0
     for r in routes:
         c, t = route_counts(r["id"])
@@ -321,9 +410,11 @@ def photos_progress(p) -> str:
         return "✅" if ok else "▫️"
     poa = "✅ Фото доверенности на возврат" if p["photo_poa"] else (
         "➖ Доверенность отсутствует" if p["poa_absent"] else "▫️ Фото доверенности на возврат")
+    n_extra = len(extra_photos(p["id"]))
     return (f"{mark(p['photo_display'])} Фото выкладки\n"
             f"{mark(p['photo_invoice'])} Фото накладной\n"
-            f"{poa}")
+            f"{poa}"
+            + (f"\n📎 Дополнительные фото: {n_extra}" if n_extra else ""))
 
 
 def next_step(p) -> str | None:

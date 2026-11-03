@@ -1,17 +1,18 @@
 """Сценарии водителя."""
+import asyncio
 from html import escape as h
 
 from aiogram import Bot, F, Router
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InputMediaDocument, InputMediaPhoto, InputMediaVideo, Message
 
 import db
 import services as S
-from common import extract_content, is_admin, notify_admins, send_content, user_label
-from keyboards import (DRIVER_BUTTONS, B_INSTR, B_MY_ROUTE, B_PROBLEM, B_START, CANCEL, CANCEL_KB, DRIVER_KB, ADMIN_KB,
-                       ikb, short)
+from common import ROLE_NAMES, admin_ids, extract_content, notify_admins, role_of, send_content, user_label
+from keyboards import (DRIVER_BUTTONS, B_INSTR, B_MY_ROUTE, B_PROBLEM, B_SEND_PROBLEM, B_START, CANCEL, CANCEL_KB,
+                       DRIVER_KB, PROBLEM_KB, ikb, kb_for, short)
 
 router = Router(name="driver")
 
@@ -28,32 +29,71 @@ class ProblemFlow(StatesGroup):
     text = State()
 
 
-NOT_MENU = ~F.text.in_(DRIVER_BUTTONS | {CANCEL})
+NOT_MENU = ~F.text.in_(DRIVER_BUTTONS | {CANCEL, B_SEND_PROBLEM})
 
+PHOTO_HINT = "📌 <i>Следите за тем, чтобы фото были чёткие и читабельные.</i>"
 STEP_PROMPTS = {
-    "display": "📸 <b>Фото 1 из 3:</b> выкладка продукции.\nОтправьте фотографию.",
-    "invoice": "📸 <b>Фото 2 из 3:</b> накладная с печатью и подписью грузополучателя.\nОтправьте фотографию.",
+    "display": "📸 <b>Фото 1 из 3:</b> выкладка продукции.\nОтправьте фотографию.\n\n" + PHOTO_HINT,
+    "invoice": "📸 <b>Фото 2 из 3:</b> накладная с печатью и подписью грузополучателя.\nОтправьте фотографию.\n\n"
+               + PHOTO_HINT,
     "poa": "📸 <b>Фото 3 из 3:</b> доверенность на возврат.\n"
-           "Отправьте фотографию или нажмите «Доверенность отсутствует».",
+           "Отправьте фотографию или нажмите «Доверенность отсутствует».\n\n" + PHOTO_HINT,
 }
+DRIVER_WELCOME = ("Здравствуйте, уважаемый водитель! С данным ботом выполнять доставку станет проще и удобнее. "
+                  "Для регистрации введите ваши Имя и Фамилию:")
+
+# Отложенный ответ: когда водитель шлёт альбом из 10 фото, бот отвечает один раз, а не 10
+_pending: dict[int, asyncio.Task] = {}
+
+
+def debounce(uid: int, coro_factory, delay: float = 1.5) -> None:
+    old = _pending.pop(uid, None)
+    if old:
+        old.cancel()
+
+    async def run():
+        try:
+            await asyncio.sleep(delay)
+            _pending.pop(uid, None)
+            await coro_factory()
+        except asyncio.CancelledError:
+            pass
+
+    _pending[uid] = asyncio.create_task(run())
+
+
+def media_of(message: Message) -> tuple[str, str, str | None] | None:
+    """(file_id, тип, имя файла) для фото/видео/документа"""
+    if message.photo:
+        return message.photo[-1].file_id, "photo", None
+    if message.video:
+        return message.video.file_id, "video", message.video.file_name
+    if message.document:
+        return message.document.file_id, "document", message.document.file_name
+    return None
 STEP_FIELD = {"display": "photo_display", "invoice": "photo_invoice", "poa": "photo_poa"}
 
 
 # ------------------------------------------------------------ helpers -----
 
+CLOSED_TEXT = ("🔒 <b>Бот EVA Press закрытый.</b>\n"
+               "Доступ только по приглашению. Попросите у администратора ссылку-приглашение "
+               "и откройте её.")
+
+
 def get_driver(uid: int):
-    return db.q1("SELECT * FROM users WHERE tg_id=? AND active=1", (uid,))
+    return db.q1("SELECT * FROM users WHERE tg_id=? AND active=1 AND COALESCE(role,'driver')='driver'", (uid,))
 
 
 def own_point(uid: int, pid: int):
-    """Точка, если она на маршруте этого водителя."""
-    return db.q1("SELECT p.* FROM points p JOIN routes r ON r.id=p.route_id WHERE p.id=? AND r.driver_id=?",
-                 (pid, uid))
+    """Точка, если она на маршруте этого водителя и рейс не закрыт."""
+    return db.q1("SELECT p.* FROM points p JOIN routes r ON r.id=p.route_id JOIN workbooks w ON w.id=r.workbook_id "
+                 "WHERE p.id=? AND r.driver_id=? AND w.closed_at IS NULL", (pid, uid))
 
 
 def own_route(uid: int, rid: int):
     r = S.route_with_wb(rid)
-    return r if r and r["driver_id"] == uid else None
+    return r if r and r["driver_id"] == uid and not r["wb_closed_at"] else None
 
 
 def route_view(rid: int):
@@ -93,10 +133,13 @@ async def ask_step(message: Message, state: FSMContext, p):
         await message.answer(f"<b>{h(short(p['address'], 80))}</b>\n\n{S.photos_progress(p)}\n\n{STEP_PROMPTS[step]}",
                              reply_markup=ikb(rows))
     else:
-        await state.clear()
+        # обязательные фото есть — остаёмся в режиме приёма: всё, что пришлёт водитель, — доп. фото
+        await state.set_state(PointFlow.photo)
+        await state.update_data(point_id=p["id"])
         await message.answer(
             f"<b>{h(short(p['address'], 80))}</b>\n\n{S.photos_progress(p)}\n\n"
-            f"Все фото загружены. Нажмите «Закрыть точку».",
+            f"Обязательные фото загружены. Если ситуация нестандартная, отправьте дополнительные фото — "
+            f"их количество не ограничено. Затем нажмите «Закрыть точку».\n\n{PHOTO_HINT}",
             reply_markup=ikb([[("✅ Закрыть точку", f"pc:{p['id']}")],
                               [("🔁 Переснять фото", f"pr:{p['id']}")],
                               [("⬅️ К списку точек", f"r:{p['route_id']}")]]))
@@ -105,20 +148,29 @@ async def ask_step(message: Message, state: FSMContext, p):
 # ------------------------------------------------------------ start/reg ---
 
 @router.message(CommandStart())
-async def start(message: Message, state: FSMContext):
+async def start(message: Message, state: FSMContext, command: CommandObject | None = None):
     await state.clear()
     uid = message.from_user.id
-    if is_admin(uid):
-        await message.answer("👋 Добро пожаловать, администратор!\n"
-                             "Загрузите Excel с маршрутами (просто отправьте файл) или выберите действие в меню.\n"
-                             "Справка: /help", reply_markup=ADMIN_KB)
-        return
     if get_driver(uid):
         await message.answer("👋 Здравствуйте! Выберите действие в меню.", reply_markup=DRIVER_KB)
         return
-    await state.set_state(Reg.name)
-    await message.answer("👋 Здравствуйте! Это бот транспортного логиста EVA Press.\n\n"
-                         "Для регистрации введите ваши <b>Фамилию Имя Отчество</b>:")
+    arg = (command.args or "") if command else ""
+    if arg.startswith("inv_"):
+        inv = S.check_invite(arg[4:])
+        if not inv:
+            await message.answer("❌ Приглашение недействительно: оно уже использовано, отозвано или истёк срок.\n"
+                                 "Попросите у администратора новую ссылку.")
+            return
+        await state.set_state(Reg.name)
+        await state.update_data(invite=inv["code"])
+        if inv["role"] == "driver":
+            await message.answer(DRIVER_WELCOME)
+        else:
+            await message.answer(f"👋 Здравствуйте! Вас пригласили в бот транспортного логиста EVA Press "
+                                 f"с ролью <b>{ROLE_NAMES.get(inv['role'], inv['role'])}</b>.\n\n"
+                                 f"Для регистрации введите ваши Имя и Фамилию:")
+        return
+    await message.answer(CLOSED_TEXT)
 
 
 @router.message(Command("myid"))
@@ -130,33 +182,48 @@ async def myid(message: Message):
 async def reg_name(message: Message, state: FSMContext, bot: Bot):
     name = " ".join(message.text.split())
     if len(name) < 5 or len(name.split()) < 2 or name.startswith("/"):
-        await message.answer("Введите ФИО полностью, например: <i>Иванов Иван Иванович</i>")
+        await message.answer("Введите Имя и Фамилию полностью, например: <i>Иван Иванов</i>")
         return
-    db.x("INSERT INTO users(tg_id, full_name, username, created_at) VALUES(?,?,?,?) "
-         "ON CONFLICT(tg_id) DO UPDATE SET full_name=excluded.full_name, username=excluded.username, active=1",
-         (message.from_user.id, name, message.from_user.username, db.now_s()))
+    code = (await state.get_data()).get("invite")
+    inv = S.check_invite(code)
     await state.clear()
-    await message.answer(f"✅ Вы зарегистрированы как <b>{h(name)}</b>.\n"
-                         f"Когда логист назначит вам маршрут, нажмите «{B_START}».", reply_markup=DRIVER_KB)
-    await notify_admins(bot, f"🆕 Зарегистрирован водитель: {user_label(message.from_user.id)}")
+    if not inv or not S.use_invite(code, message.from_user.id):
+        await message.answer("❌ Приглашение недействительно. Попросите у администратора новую ссылку.")
+        return
+    role = inv["role"]
+    db.x("INSERT INTO users(tg_id, full_name, username, role, created_at) VALUES(?,?,?,?,?) "
+         "ON CONFLICT(tg_id) DO UPDATE SET full_name=excluded.full_name, username=excluded.username, "
+         "role=excluded.role, active=1",
+         (message.from_user.id, name, message.from_user.username, role, db.now_s()))
+    hint = {
+        "driver": f"Когда логист назначит вам маршрут, нажмите «{B_START}».",
+        "customer": "Вам доступны статистика и отчёты по маршрутам. Справка: /help",
+        "admin": "Вам доступны все функции администратора. Справка: /help",
+    }[role]
+    await message.answer(f"✅ Вы зарегистрированы как <b>{h(name)}</b> ({ROLE_NAMES[role]}).\n{hint}",
+                         reply_markup=kb_for(role))
+    await notify_admins(bot, f"🆕 По приглашению зарегистрирован(а) {ROLE_NAMES[role].lower()}: "
+                             f"{user_label(message.from_user.id)}")
 
 
 # ------------------------------------------------------------ guards ------
 
 @router.message(F.func(lambda m: not get_driver(m.from_user.id)))
 async def not_registered(message: Message, state: FSMContext):
-    await start(message, state)
+    await state.clear()
+    await message.answer(CLOSED_TEXT)
 
 
 @router.callback_query(F.func(lambda c: not get_driver(c.from_user.id)))
 async def not_registered_cb(cb: CallbackQuery):
-    await cb.answer("Сначала зарегистрируйтесь: /start", show_alert=True)
+    await cb.answer("Нет доступа. Бот работает по приглашениям.", show_alert=True)
 
 
 # ------------------------------------------------------------ menu --------
 
 @router.message(F.text == CANCEL)
 async def cancel(message: Message, state: FSMContext):
+    _problem_buf.pop(message.from_user.id, None)
     await state.clear()
     await message.answer("Отменено.", reply_markup=DRIVER_KB)
 
@@ -212,7 +279,7 @@ async def my_route(message: Message, state: FSMContext):
 async def cb_route(cb: CallbackQuery, state: FSMContext):
     rid = int(cb.data[2:])
     if not own_route(cb.from_user.id, rid):
-        await cb.answer("Маршрут вам больше не назначен", show_alert=True)
+        await cb.answer("Маршрут недоступен: рейс закрыт или маршрут снят", show_alert=True)
         return
     await state.clear()
     text, markup = route_view(rid)
@@ -227,7 +294,7 @@ async def cb_route(cb: CallbackQuery, state: FSMContext):
 async def cb_point(cb: CallbackQuery):
     p = own_point(cb.from_user.id, int(cb.data[2:]))
     if not p:
-        await cb.answer("Точка не найдена", show_alert=True)
+        await cb.answer("Точка недоступна: рейс закрыт или маршрут снят", show_alert=True)
         return
     text, markup = point_view(p)
     try:
@@ -243,7 +310,7 @@ async def cb_point(cb: CallbackQuery):
 async def cb_open_point(cb: CallbackQuery, state: FSMContext):
     p = own_point(cb.from_user.id, int(cb.data[3:]))
     if not p:
-        await cb.answer("Точка не найдена", show_alert=True)
+        await cb.answer("Точка недоступна: рейс закрыт или маршрут снят", show_alert=True)
         return
     if p["status"] == "closed":
         await cb.answer("Точка уже закрыта", show_alert=True)
@@ -264,16 +331,43 @@ async def got_photo(message: Message, state: FSMContext):
         await message.answer("Точка не найдена или уже закрыта.")
         return
     step = S.next_step(p)
+    # чтение и запись без await между ними — альбом из нескольких фото не «перетрёт» шаги
     if step:
-        # чтение и запись без await между ними — альбом из нескольких фото не «перетрёт» шаги
         db.x(f"UPDATE points SET {STEP_FIELD[step]}=? WHERE id=?", (message.photo[-1].file_id, p["id"]))
-    p = own_point(message.from_user.id, p["id"])
-    await ask_step(message, state, p)
+    else:
+        S.add_photo("extra", message.photo[-1].file_id, "photo", message.from_user.id,
+                    point_id=p["id"], route_id=p["route_id"])
+    uid, pid = message.from_user.id, p["id"]
+
+    async def reply():
+        fresh = own_point(uid, pid)
+        if fresh and fresh["status"] != "closed":
+            await ask_step(message, state, fresh)
+
+    debounce(uid, reply)
 
 
-@router.message(PointFlow.photo, F.document)
-async def got_doc(message: Message):
-    await message.answer("Пожалуйста, отправьте снимок как <b>фото</b> (не файлом).")
+@router.message(PointFlow.photo, F.document | F.video)
+async def got_doc(message: Message, state: FSMContext):
+    data = await state.get_data()
+    p = own_point(message.from_user.id, data.get("point_id", 0))
+    if not p or p["status"] == "closed":
+        await state.clear()
+        await message.answer("Точка не найдена или уже закрыта.")
+        return
+    if S.next_step(p):
+        await message.answer("Обязательные снимки отправьте как <b>фото</b> (не файлом).")
+        return
+    fid, ftype, fname = media_of(message)
+    S.add_photo("extra", fid, ftype, message.from_user.id, point_id=p["id"], route_id=p["route_id"], file_name=fname)
+    uid, pid = message.from_user.id, p["id"]
+
+    async def reply():
+        fresh = own_point(uid, pid)
+        if fresh and fresh["status"] != "closed":
+            await ask_step(message, state, fresh)
+
+    debounce(uid, reply)
 
 
 @router.message(PointFlow.photo, F.text, NOT_MENU)
@@ -303,6 +397,7 @@ async def cb_reshoot(cb: CallbackQuery, state: FSMContext):
         return
     db.x("UPDATE points SET photo_display=NULL, photo_invoice=NULL, photo_poa=NULL, poa_absent=0 WHERE id=?",
          (p["id"],))
+    db.x("DELETE FROM photos WHERE kind='extra' AND point_id=?", (p["id"],))
     await cb.answer("Фото сброшены")
     await ask_step(cb.message, state, own_point(cb.from_user.id, p["id"]))
 
@@ -312,7 +407,7 @@ async def cb_close(cb: CallbackQuery, state: FSMContext, bot: Bot):
     uid = cb.from_user.id
     p = own_point(uid, int(cb.data[3:]))
     if not p:
-        await cb.answer("Точка не найдена", show_alert=True)
+        await cb.answer("Точка недоступна: рейс закрыт или маршрут снят", show_alert=True)
         return
     if p["status"] == "closed":
         await cb.answer("Точка уже закрыта")
@@ -364,43 +459,114 @@ async def cb_problem_point(cb: CallbackQuery, state: FSMContext):
     if pid:
         p = own_point(cb.from_user.id, pid)
         if not p:
-            await cb.answer("Точка не найдена", show_alert=True)
+            await cb.answer("Точка недоступна: рейс закрыт или маршрут снят", show_alert=True)
             return
         addr = p["address"]
         if (cb.message.text or "").startswith("📍"):  # нажато из карточки точки — показываем памятку
             await cb.message.answer(db.get_setting("problem_help", S.DEFAULT_PROBLEM_HELP))
     await state.set_state(ProblemFlow.text)
     await state.update_data(problem_point=pid)
+    _problem_buf[cb.from_user.id] = {"texts": [], "files": []}
     await cb.answer()
-    await cb.message.answer(f"Адрес: <b>{h(addr)}</b>\n\n✍️ Опишите ситуацию одним сообщением "
-                            f"(можно приложить фото с подписью). Логист получит его сразу.",
-                            reply_markup=CANCEL_KB)
+    await cb.message.answer(f"Адрес: <b>{h(addr)}</b>\n\n"
+                            f"✍️ Опишите ситуацию и прикрепите фото — можно несколькими сообщениями, "
+                            f"количество фото не ограничено.\n\n{PHOTO_HINT}\n\n"
+                            f"Когда всё отправите, нажмите «{B_SEND_PROBLEM}».",
+                            reply_markup=PROBLEM_KB)
 
 
-@router.message(ProblemFlow.text, NOT_MENU)
-async def problem_text(message: Message, state: FSMContext, bot: Bot):
-    text, file_id, file_type = extract_content(message)
-    if not text and not file_id:
-        await message.answer("Отправьте текст или фото с описанием.")
+_problem_buf: dict[int, dict] = {}
+
+
+def _buf(uid: int) -> dict:
+    return _problem_buf.setdefault(uid, {"texts": [], "files": []})
+
+
+@router.message(ProblemFlow.text, F.text == B_SEND_PROBLEM)
+async def problem_send(message: Message, state: FSMContext, bot: Bot):
+    uid = message.from_user.id
+    pend = _pending.pop(uid, None)
+    if pend:
+        pend.cancel()
+    buf = _buf(uid)
+    if not buf["texts"] and not buf["files"]:
+        await message.answer("Сначала напишите, что случилось, или прикрепите фото.")
         return
     data = await state.get_data()
     pid = data.get("problem_point") or None
-    uid = message.from_user.id
     p = own_point(uid, pid) if pid else None
-    rid = p["route_id"] if p else (S.driver_routes(uid)[0]["id"] if S.driver_routes(uid) else None)
-    plain = message.text or message.caption or ""
-    db.x("INSERT INTO problems(point_id, route_id, driver_id, text, file_id, file_type, created_at) "
-         "VALUES(?,?,?,?,?,?,?)", (p["id"] if p else None, rid, uid, plain, file_id, file_type, db.now_s()))
+    routes = S.driver_routes(uid)
+    rid = p["route_id"] if p else (routes[0]["id"] if routes else None)
+    text = "\n".join(t for t in buf["texts"] if t)
+    files = list(buf["files"])
+    prob_id = db.x("INSERT INTO problems(point_id, route_id, driver_id, text, created_at) VALUES(?,?,?,?,?)",
+                   (p["id"] if p else None, rid, uid, text, db.now_s()))
+    for fid, ftype, fname in files:
+        S.add_photo("problem", fid, ftype, uid, point_id=p["id"] if p else None, route_id=rid,
+                    problem_id=prob_id, file_name=fname)
+    _problem_buf.pop(uid, None)
     await state.clear()
-    await message.answer("✅ Сообщение отправлено логисту. Ожидайте ответа.", reply_markup=DRIVER_KB)
+    await message.answer("✅ Сообщение отправлено логисту"
+                         + (f" (вложений: {len(files)})" if files else "") + ". Ожидайте ответа.",
+                         reply_markup=DRIVER_KB)
     r = S.route_with_wb(rid) if rid else None
     head = (f"⚠️ <b>Проблема на адресе</b>\n"
             f"👤 {user_label(uid)}\n"
             + (f"🗺 Маршрут №{h(r['route_no'])} ({S.fmt_date(r['work_date'])})\n" if r else "")
             + (f"📍 {p['seq']}. {h(p['network'])} — {h(p['address'])}\n" if p else "📍 без привязки к адресу\n")
-            + f"\n{text or '(без текста)'}")
-    await notify_admins(bot, head, reply_markup=ikb([[("✉️ Ответить водителю", f"ans:{uid}")]]),
-                        file_id=file_id, file_type=file_type)
+            + (f"📷 Вложений: {len(files)}\n" if files else "")
+            + f"\n{h(text) if text else '(без текста)'}")
+    await notify_admins(bot, head, reply_markup=ikb([[("✉️ Ответить водителю", f"ans:{uid}")]]))
+    if files:
+        for aid in admin_ids():
+            try:
+                await send_files(bot, aid, files)
+            except Exception:
+                pass
+
+
+async def send_files(bot: Bot, chat_id: int, files: list[tuple[str, str, str | None]]) -> None:
+    """Фото и видео — альбомами по 10, документы — альбомами документов по 10."""
+    visual = [f for f in files if f[1] in ("photo", "video")]
+    docs = [f for f in files if f[1] not in ("photo", "video")]
+    for i in range(0, len(visual), 10):
+        chunk = visual[i:i + 10]
+        if len(chunk) == 1:
+            fid, ftype, _ = chunk[0]
+            await (bot.send_photo if ftype == "photo" else bot.send_video)(chat_id, fid)
+        else:
+            await bot.send_media_group(chat_id, [InputMediaPhoto(media=f) if t == "photo" else InputMediaVideo(media=f)
+                                                 for f, t, _ in chunk])
+        await asyncio.sleep(0.3)
+    for i in range(0, len(docs), 10):
+        chunk = docs[i:i + 10]
+        if len(chunk) == 1:
+            await bot.send_document(chat_id, chunk[0][0])
+        else:
+            await bot.send_media_group(chat_id, [InputMediaDocument(media=f) for f, _, _ in chunk])
+        await asyncio.sleep(0.3)
+
+
+@router.message(ProblemFlow.text, NOT_MENU)
+async def problem_collect(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    buf = _buf(uid)
+    media = media_of(message)
+    txt = message.text or message.caption
+    if txt:
+        buf["texts"].append(txt)
+    if media:
+        buf["files"].append(media)
+    if not txt and not media:
+        await message.answer("Отправьте текст, фото, видео или файл.")
+        return
+
+    async def reply():
+        b = _buf(uid)
+        await message.answer(f"📥 Принято: текст — {len(b['texts'])} сообщ., вложений — {len(b['files'])}.\n"
+                             f"Можно добавить ещё или нажмите «{B_SEND_PROBLEM}».", reply_markup=PROBLEM_KB)
+
+    debounce(uid, reply)
 
 
 # ------------------------------------------------------------ instructions

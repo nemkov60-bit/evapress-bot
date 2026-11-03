@@ -75,6 +75,45 @@ CREATE INDEX IF NOT EXISTS ix_points_route ON points(route_id);
 CREATE INDEX IF NOT EXISTS ix_routes_driver ON routes(driver_id);
 """
 conn.executescript(SCHEMA)
+
+
+def _add_col(table: str, col: str, ddl: str) -> None:
+    cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+    if col not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
+# миграции v2: роли, приглашения, закрытие рейса
+_add_col("users", "role", "role TEXT DEFAULT 'driver'")        # admin / customer / driver
+_add_col("workbooks", "closed_at", "closed_at TEXT")
+_add_col("workbooks", "closed_by", "closed_by INTEGER")
+conn.executescript("""
+CREATE TABLE IF NOT EXISTS invites(
+    code TEXT PRIMARY KEY,
+    role TEXT NOT NULL,
+    created_by INTEGER,
+    created_at TEXT,
+    expires_at TEXT,
+    used_by INTEGER,
+    used_at TEXT,
+    revoked INTEGER DEFAULT 0
+);
+-- v3: дополнительные фото к точке и фото к «Проблеме на адресе», без ограничения по количеству
+CREATE TABLE IF NOT EXISTS photos(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,              -- extra / problem
+    point_id INTEGER, route_id INTEGER, problem_id INTEGER, driver_id INTEGER,
+    file_id TEXT NOT NULL, file_type TEXT, file_name TEXT,
+    created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_photos_point ON photos(point_id);
+CREATE INDEX IF NOT EXISTS ix_photos_problem ON photos(problem_id);
+""")
+# перенос единственного фото из старых записей problems в photos
+conn.execute("""INSERT INTO photos(kind, point_id, route_id, problem_id, driver_id, file_id, file_type, created_at)
+                SELECT 'problem', point_id, route_id, id, driver_id, file_id, file_type, created_at
+                FROM problems WHERE file_id IS NOT NULL""")
+conn.execute("UPDATE problems SET file_id=NULL WHERE file_id IS NOT NULL")
 conn.commit()
 
 
@@ -98,6 +137,13 @@ def x(sql: str, params=()) -> int:
     cur = conn.execute(sql, params)
     conn.commit()
     return cur.lastrowid
+
+
+def xc(sql: str, params=()) -> int:
+    """execute + commit, возвращает число изменённых строк"""
+    cur = conn.execute(sql, params)
+    conn.commit()
+    return cur.rowcount
 
 
 def get_setting(key: str, default: str = "") -> str:

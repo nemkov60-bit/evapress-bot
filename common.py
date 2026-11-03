@@ -8,13 +8,33 @@ import db
 from config import ADMIN_IDS
 
 
+ROLE_NAMES = {"admin": "Администратор", "customer": "Заказчик", "driver": "Водитель"}
+
+
+def role_of(uid: int) -> str | None:
+    """admin / customer / driver или None (нет доступа)."""
+    if uid in ADMIN_IDS:
+        return "admin"
+    u = db.q1("SELECT role FROM users WHERE tg_id=? AND active=1", (uid,))
+    return (u["role"] or "driver") if u else None
+
+
 def is_admin(uid: int) -> bool:
-    return uid in ADMIN_IDS
+    return role_of(uid) == "admin"
+
+
+def is_staff(uid: int) -> bool:
+    """Администратор или заказчик (наблюдатель)."""
+    return role_of(uid) in ("admin", "customer")
+
+
+def admin_ids() -> set[int]:
+    return set(ADMIN_IDS) | {r["tg_id"] for r in db.q("SELECT tg_id FROM users WHERE role='admin' AND active=1")}
 
 
 async def notify_admins(bot: Bot, text: str, reply_markup: InlineKeyboardMarkup | None = None,
                         file_id: str | None = None, file_type: str | None = None) -> None:
-    for aid in ADMIN_IDS:
+    for aid in admin_ids():
         try:
             await send_content(bot, aid, text, file_id, file_type, reply_markup)
         except Exception:  # админ не запускал бота и т.п.

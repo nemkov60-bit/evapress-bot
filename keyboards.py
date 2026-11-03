@@ -6,16 +6,21 @@ B_START = "🚚 Начать маршрут"
 B_MY_ROUTE = "📋 Мой маршрут"
 B_PROBLEM = "⚠️ Проблема на адресе"
 B_INSTR = "📖 Инструкции"
+B_SEND_PROBLEM = "📨 Отправить логисту"
 
-# --- кнопки админа
+# --- кнопки админа / заказчика
 A_UPLOAD = "📥 Загрузить Excel"
 A_ASSIGN = "🧭 Назначить маршруты"
 A_STATS = "📊 Статистика"
 A_REPORT = "📑 Отчёт"
 A_EXPORT = "📤 Выгрузить Excel"
-A_INSTR = "📖 Инструкции водителям"
+A_CLOSE = "🔒 Закрыть рейс"
+A_ZIP = "🗜 Сохранить .ZIP"
 A_MSG = "✉️ Сообщение водителям"
-A_DRIVERS = "👥 Водители"
+A_INSTR = "📖 Инструкции водителям"
+A_INSTR_ADD = "➕ Добавить инструкцию"
+A_USERS = "👥 Пользователи"
+A_INVITE = "🎟 Пригласить"
 A_PROBLEM_TEXT = "⚙️ Текст «Проблема»"
 
 CANCEL = "❌ Отмена"
@@ -35,14 +40,23 @@ DRIVER_KB = kb([[B_START], [B_MY_ROUTE, B_PROBLEM], [B_INSTR]])
 ADMIN_KB = kb([
     [A_UPLOAD, A_ASSIGN],
     [A_STATS, A_REPORT],
-    [A_EXPORT, A_INSTR],
-    [A_MSG, A_DRIVERS],
+    [A_EXPORT, A_CLOSE],
+    [A_ZIP, A_MSG],
+    [A_INSTR, A_INSTR_ADD],
+    [A_USERS, A_INVITE],
     [A_PROBLEM_TEXT],
 ])
+CUSTOMER_KB = kb([[A_STATS, A_REPORT], [A_EXPORT]])
 CANCEL_KB = kb([[CANCEL]])
+PROBLEM_KB = kb([[B_SEND_PROBLEM], [CANCEL]])
 
 DRIVER_BUTTONS = {B_START, B_MY_ROUTE, B_PROBLEM, B_INSTR}
-ADMIN_BUTTONS = {A_UPLOAD, A_ASSIGN, A_STATS, A_REPORT, A_EXPORT, A_INSTR, A_MSG, A_DRIVERS, A_PROBLEM_TEXT}
+ADMIN_BUTTONS = {A_UPLOAD, A_ASSIGN, A_STATS, A_REPORT, A_EXPORT, A_CLOSE, A_ZIP, A_MSG, A_INSTR, A_INSTR_ADD,
+                 A_USERS, A_INVITE, A_PROBLEM_TEXT}
+
+
+def kb_for(role: str | None) -> ReplyKeyboardMarkup:
+    return {"admin": ADMIN_KB, "customer": CUSTOMER_KB}.get(role, DRIVER_KB)
 
 
 def short(text: str, n: int = 48) -> str:
