@@ -137,7 +137,7 @@ def point_view(p):
     r = S.route_with_wb(p["route_id"])
     block = N.point_block(p, r["work_date"])
     text = S.point_text(p, r) + ("\n\n" + block if block else "")
-    rows = []
+    rows = [[("🧭 Маршрут до точки", N.nav_url(p))]]
     if p["status"] != "closed":
         rows.append([("📍 Открыть точку", f"po:{p['id']}")])
     rows.append([("⚠️ Проблема на адресе", f"pp:{p['id']}")])

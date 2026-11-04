@@ -10,7 +10,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
+import backup
 import db
+import notes as N
 import services as S
 from common import is_admin, send_poster, user_label
 from handlers_admin import ADM, IsStaff, NOT_MENU, safe_edit, zip_send
@@ -23,6 +25,7 @@ router.callback_query.filter(IsStaff())
 
 class Trip(StatesGroup):
     rename = State()
+    geo = State()            # админ указывает точку на карте (геопозиция)
     photo = State()          # админ загружает фото в точку
     close_reason = State()   # причина закрытия точки без фото
 
@@ -77,6 +80,7 @@ def trip_card(wb):
             [("✏️ Переименовать рейс", f"tn:{wb['id']}")]]
     if wb["closed_at"]:
         rows.append([("↩️ Открыть рейс снова", f"ro:{wb['id']}")])
+        rows.append([("🗑 Удалить рейс", f"td:{wb['id']}")])
     else:
         rows.append([("🔒 Закрыть рейс", f"cl:{wb['id']}")])
     rows.append([("🗜 ZIP рейса", f"zq2:{wb['id']}")])
@@ -225,6 +229,10 @@ def admin_point_card(pid: int):
         rows.append([("✅ Закрыть точку", f"apx:{pid}")])
     elif p["status"] == "closed":
         rows.append([("↩️ Открыть точку снова", f"apo:{pid}")])
+    g = N.geo(p)
+    text += ("\n🧭 Точка на карте: указана" if g else
+             "\n🧭 Точка на карте не указана — маршрут строится по тексту адреса")
+    rows.append([("🧭 Маршрут до точки", N.nav_url(p)), ("📍 Указать на карте", f"agl:{pid}")])
     rows.append([("⬅️ К точкам маршрута", f"rpts:{p['route_id']}")])
     return text, ikb(rows)
 
@@ -351,6 +359,89 @@ async def cb_admin_reopen_point(cb: CallbackQuery):
     text, markup = admin_point_card(pid)
     await cb.message.answer(("↩️ Точка снова открыта" + (", маршрут тоже открыт" if r["closed_at"] else "") + ".\n\n")
                             + text, reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("agl:"), ADM)
+async def cb_admin_geo(cb: CallbackQuery, state: FSMContext):
+    pid = int(cb.data[4:])
+    await cb.answer()
+    await state.set_state(Trip.geo)
+    await state.update_data(geo_pid=pid)
+    await cb.message.answer("📍 Отправьте геопозицию точки: скрепка 📎 → «Геопозиция» → передвиньте метку на вход "
+                            "в магазин / зону разгрузки → «Отправить выбранную геопозицию».\n"
+                            "Координаты сохранятся для этого адреса во всех будущих рейсах.", reply_markup=CANCEL_KB)
+
+
+@router.message(Trip.geo, F.location, ADM)
+async def admin_geo_save(message: Message, state: FSMContext):
+    pid = (await state.get_data()).get("geo_pid")
+    await state.clear()
+    p = db.q1("SELECT * FROM points WHERE id=?", (pid,))
+    N.set_geo(p, message.location.latitude, message.location.longitude, message.from_user.id)
+    await message.answer(f"✅ Точка на карте сохранена для адреса {h(p['address'])}.", reply_markup=ADMIN_KB)
+    text, markup = admin_point_card(pid)
+    await message.answer(text, reply_markup=markup)
+
+
+@router.message(Trip.geo, NOT_MENU, ADM)
+async def admin_geo_wrong(message: Message):
+    await message.answer("Нужна геопозиция: скрепка 📎 → «Геопозиция».")
+
+
+# ------------------------------------------------------------ удаление рейса
+
+@router.callback_query(F.data.startswith("td:"), ADM)
+async def cb_trip_delete_ask(cb: CallbackQuery):
+    wb = db.q1("SELECT * FROM workbooks WHERE id=?", (int(cb.data[3:]),))
+    await cb.answer()
+    if not wb or not wb["closed_at"]:
+        await cb.message.answer("Удалить можно только закрытый рейс.")
+        return
+    c, t = S.wb_totals(wb["id"])
+    nph = db.q1("SELECT COUNT(*) n FROM photos WHERE route_id IN (SELECT id FROM routes WHERE workbook_id=?)",
+                (wb["id"],))["n"]
+    await cb.message.answer(
+        f"🗑 Удалить рейс <b>{h(S.wb_title(wb))}</b>?\n"
+        f"Будут удалены: маршруты, {t} точек (закрыто {c}), отметки, ссылки на фото ({nph} доп.), проблемы, "
+        f"сохранённый ZIP в списке «🗜 ZIP-архивы».\n"
+        f"Постоянные примечания и заметки к адресам, водители и инструкции останутся.\n\n"
+        f"Перед удалением бот пришлёт вам резервную копию — из неё рейс можно вернуть.",
+        reply_markup=ikb([[("🗑 Да, удалить рейс", f"tdc:{wb['id']}")], [("Отмена", "noop")]]))
+
+
+@router.callback_query(F.data.startswith("tdc:"), ADM)
+async def cb_trip_delete(cb: CallbackQuery, bot: Bot):
+    wb_id = int(cb.data[4:])
+    wb = db.q1("SELECT * FROM workbooks WHERE id=?", (wb_id,))
+    if not wb or not wb["closed_at"]:
+        await cb.answer("Рейс не найден или не закрыт", show_alert=True)
+        return
+    await cb.answer("Удаляю…")
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    errors = await backup.send_backup(bot, f"перед удалением рейса «{S.wb_title(wb)}»", {cb.from_user.id})
+    if errors:
+        await cb.message.answer("❌ Не удалось сделать резервную копию — рейс не удалён.")
+        return
+    rids = [r["id"] for r in db.q("SELECT id FROM routes WHERE workbook_id=?", (wb_id,))]
+    if rids:
+        marks = ",".join("?" * len(rids))
+        db.x(f"DELETE FROM photos WHERE route_id IN ({marks})", rids)
+        db.x(f"DELETE FROM problems WHERE route_id IN ({marks})", rids)
+        db.x(f"DELETE FROM points WHERE route_id IN ({marks})", rids)
+    db.x("DELETE FROM routes WHERE workbook_id=?", (wb_id,))
+    db.x("DELETE FROM zip_archives WHERE workbook_id=?", (wb_id,))
+    db.x("DELETE FROM workbooks WHERE id=?", (wb_id,))
+    try:
+        from pathlib import Path
+        f = Path(wb["path"])
+        if f.exists() and not db.q1("SELECT 1 FROM workbooks WHERE path=?", (wb["path"],)):
+            f.unlink()
+    except Exception:
+        pass
+    await cb.message.answer(f"🗑 Рейс <b>{h(S.wb_title(wb))}</b> удалён. Резервная копия — выше.", reply_markup=ADMIN_KB)
 
 
 # ------------------------------------------------------------ запросы водителя на закрытие без фото

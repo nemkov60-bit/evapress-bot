@@ -44,6 +44,9 @@ BACKUP_CHAT_ID = BACKUP_CHANNEL_ID if BACKUP_CHANNEL_ID else (
     if os.getenv("ADMIN_IDS", "").strip()[:1].isdigit() else None)
 # Как часто (минут) обновлять автокопию, если данные менялись
 AUTOSAVE_MINUTES = int(os.getenv("AUTOSAVE_MINUTES", "5"))
+# Добавлять к адресу для поиска в Яндекс Картах, если в адресе нет координат (например «Санкт-Петербург»).
+# Пусто — адрес как есть: Яндекс ищет рядом с текущим местоположением водителя.
+NAV_REGION = os.getenv("NAV_REGION", "").strip()
 
 for d in (DATA_DIR, WB_DIR, EXPORT_DIR):
     d.mkdir(parents=True, exist_ok=True)

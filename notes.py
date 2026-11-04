@@ -91,3 +91,28 @@ def route_block(route_no: str, work_date: str) -> str:
     if not ns:
         return ""
     return "❗ <b>ВАЖНО ПО МАРШРУТУ:</b>\n" + "\n".join(f"• {n['text']}" for n in ns)
+
+
+# ------------------------------------------------------------ навигация ---
+
+def geo(p):
+    return db.q1("SELECT * FROM point_geo WHERE point_key=?", (point_key(p),))
+
+
+def set_geo(p, lat: float, lon: float, uid: int) -> None:
+    db.x("INSERT INTO point_geo(point_key, lat, lon, set_by, set_at) VALUES(?,?,?,?,?) "
+         "ON CONFLICT(point_key) DO UPDATE SET lat=excluded.lat, lon=excluded.lon, set_by=excluded.set_by, "
+         "set_at=excluded.set_at", (point_key(p), lat, lon, uid, db.now_s()))
+
+
+def nav_url(p) -> str:
+    """Яндекс Карты с маршрутом на автомобиле от текущего местоположения до точки."""
+    from urllib.parse import quote
+    from config import NAV_REGION
+    g = geo(p)
+    if g:
+        dest = f"{g['lat']:.6f},{g['lon']:.6f}"
+    else:
+        addr = re.sub(r"\s*\(.*?\)\s*", " ", p["address"] or "").strip()  # «(Сборная, 4)» и т.п. мешают поиску
+        dest = f"{NAV_REGION}, {addr}" if NAV_REGION and NAV_REGION.lower() not in addr.lower() else addr
+    return f"https://yandex.ru/maps/?rtext=~{quote(dest)}&rtt=auto"

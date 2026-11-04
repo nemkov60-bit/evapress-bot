@@ -36,8 +36,9 @@ def kb(rows, **kw) -> ReplyKeyboardMarkup:
 
 
 def ikb(rows) -> InlineKeyboardMarkup:
-    """rows: [[(text, callback_data), ...], ...]"""
-    return InlineKeyboardMarkup(inline_keyboard=[[IB(text=t, callback_data=d) for t, d in r] for r in rows])
+    """rows: [[(text, callback_data или https-ссылка), ...], ...]"""
+    return InlineKeyboardMarkup(inline_keyboard=[[IB(text=t, url=d) if d.startswith("https://")
+                                                  else IB(text=t, callback_data=d) for t, d in r] for r in rows])
 
 
 DRIVER_KB = kb([[B_START], [B_MY_ROUTE, B_PROBLEM], [B_INSTR]])

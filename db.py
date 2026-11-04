@@ -169,6 +169,9 @@ def migrate() -> None:
     );
     """)
     conn.execute("UPDATE instructions SET version_at=COALESCE(updated_at, created_at) WHERE version_at IS NULL")
+    # v10: точные координаты адреса для кнопки «Маршрут до точки» (общие для всех дат, как заметки)
+    conn.execute("""CREATE TABLE IF NOT EXISTS point_geo(
+        point_key TEXT PRIMARY KEY, lat REAL, lon REAL, set_by INTEGER, set_at TEXT)""")
     # перенос единственного фото из старых записей problems в photos
     conn.execute("""INSERT INTO photos(kind, point_id, route_id, problem_id, driver_id, file_id, file_type, created_at)
                     SELECT 'problem', point_id, route_id, id, driver_id, file_id, file_type, created_at
