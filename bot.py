@@ -56,6 +56,8 @@ async def main():
             except Exception:
                 pass
     asyncio.create_task(backup.daily_loop(bot))
+    # сразу после запуска — свежая закреплённая автокопия (страховка перед следующей пересборкой)
+    asyncio.create_task(backup.autosave(bot, force=True))
     asyncio.create_task(backup.autosave_loop(bot))
 
     async def on_shutdown():

@@ -31,7 +31,16 @@ DEFAULT_PROBLEM_HELP = (
 def parse_date(text: str | None) -> date | None:
     if not text:
         return None
-    m = re.search(r"(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})", text)
+    # диапазон недели «02-08.11.2026» / «02_08.11.2026» → первый день: 02.11.2026
+    rng = re.search(r"(?<!\d)(\d{1,2})[-_–](\d{1,2})[.](\d{1,2})[.](\d{4})(?!\d)", text)
+    if rng:
+        d, _, mth, y = map(int, rng.groups())
+        try:
+            return date(y, mth, d)
+        except ValueError:
+            pass
+    m = re.search(r"(?<!\d)(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{4})(?!\d)", text) or \
+        re.search(r"(?<!\d)(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2})(?!\d)", text)
     if not m:
         return None
     d, mth, y = map(int, m.groups())

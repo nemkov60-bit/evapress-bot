@@ -176,18 +176,39 @@ def restore(zip_path: Path) -> Path:
 
 
 # ------------------------------------------------------------------ автокопия ---
-# Одна закреплённая копия в BACKUP_CHAT_ID, которая обновляется после изменений данных.
-# Если хостинг стёр базу при пересборке, бот при запуске сам находит закреплённую копию и восстанавливается.
+# Закреплённая копия, которая обновляется после изменений данных. Хранится в двух местах:
+#  • личный чат бота с первым администратором из ADMIN_IDS — там бот может закреплять всегда;
+#  • канал BACKUP_CHAT_ID (если задан) — для закрепления боту нужно право «Редактирование сообщений».
+# Если хостинг стёр базу, бот при запуске находит самую свежую закреплённую копию и восстанавливается.
 
 from aiogram.types import InputMediaDocument  # noqa: E402
 
-from config import AUTOSAVE_MINUTES, BACKUP_CHAT_ID  # noqa: E402
+from config import ADMIN_LIST, AUTOSAVE_MINUTES  # noqa: E402
 
 AUTO_CAPTION = ("💾 <b>Автокопия данных бота</b> — обновляется автоматически.\n"
                 "Не удаляйте и не открепляйте это сообщение: по нему бот восстановит данные, "
                 "если хостинг их потеряет.\n")
-_auto = {"msg_id": None, "day": None}
+_auto: dict[int, dict] = {}       # chat_id -> {"msg_id", "day"}
+_pin_warned: set[int] = set()
 _lock = asyncio.Lock()
+
+
+def autosave_chats() -> list[int]:
+    chats = []
+    if ADMIN_LIST:
+        chats.append(ADMIN_LIST[0])
+    if BACKUP_CHANNEL_ID and BACKUP_CHANNEL_ID not in chats:
+        chats.append(BACKUP_CHANNEL_ID)
+    return chats
+
+
+def restore_candidates() -> list[int]:
+    """Где искать закреплённую копию при пустой базе: канал из настроек и личные чаты всех админов."""
+    out = []
+    for c in ([BACKUP_CHANNEL_ID] if BACKUP_CHANNEL_ID else []) + list(ADMIN_LIST):
+        if c not in out:
+            out.append(c)
+    return out
 
 
 def _caption(meta: dict) -> str:
@@ -195,13 +216,11 @@ def _caption(meta: dict) -> str:
         ", ".join(f"{k}: {v}" for k, v in meta["counts"].items())
 
 
-async def find_pinned(bot: Bot):
-    if not BACKUP_CHAT_ID:
-        return None
+async def find_pinned(bot: Bot, chat_id: int):
     try:
-        chat = await bot.get_chat(BACKUP_CHAT_ID)
+        chat = await bot.get_chat(chat_id)
     except Exception as e:  # noqa: BLE001
-        log.warning("get_chat(%s) failed: %s", BACKUP_CHAT_ID, e)
+        log.warning("get_chat(%s) failed: %s", chat_id, e)
         return None
     pm = chat.pinned_message
     if pm and pm.document and (pm.document.file_name or "").startswith(PREFIX):
@@ -209,42 +228,58 @@ async def find_pinned(bot: Bot):
     return None
 
 
+async def _save_to(bot: Bot, chat_id: int, path: Path, meta: dict) -> None:
+    st = _auto.setdefault(chat_id, {"msg_id": None, "day": None})
+    today = db.now().date().isoformat()
+    if st["msg_id"] and st["day"] == today:
+        try:
+            await bot.edit_message_media(
+                InputMediaDocument(media=FSInputFile(path, filename=path.name), caption=_caption(meta)),
+                chat_id=chat_id, message_id=st["msg_id"])
+            return
+        except Exception as e:  # noqa: BLE001
+            if "not modified" in str(e):
+                return
+            log.warning("autosave edit in %s failed, sending new: %s", chat_id, e)
+    # раз в день и после запуска — новое сообщение (чтобы оно было последним закреплённым), старое удаляем
+    m = await bot.send_document(chat_id, FSInputFile(path, filename=path.name),
+                                caption=_caption(meta), disable_notification=True)
+    try:
+        await bot.pin_chat_message(chat_id, m.message_id, disable_notification=True)
+    except Exception as e:  # noqa: BLE001
+        log.warning("pin in %s failed: %s", chat_id, e)
+        if chat_id not in _pin_warned and ADMIN_LIST:
+            _pin_warned.add(chat_id)
+            try:
+                await bot.send_message(ADMIN_LIST[0], f"⚠️ Бот не смог закрепить автокопию в чате <code>{chat_id}</code>: "
+                                                      f"{str(e)[:150]}\nДля канала дайте боту право "
+                                                      f"«Редактирование сообщений». Копия в вашем личном чате "
+                                                      f"с ботом при этом работает.")
+            except Exception:
+                pass
+    if st["msg_id"] and st["msg_id"] != m.message_id:
+        try:
+            await bot.delete_message(chat_id, st["msg_id"])
+        except Exception:
+            pass
+    st["msg_id"], st["day"] = m.message_id, today
+
+
 async def autosave(bot: Bot, force: bool = False) -> None:
-    """Обновляет закреплённую автокопию, если данные менялись (или force)."""
-    if not BACKUP_CHAT_ID or (not db.dirty and not force) or is_empty():
+    """Обновляет закреплённую автокопию во всех местах, если данные менялись (или force)."""
+    chats = autosave_chats()
+    if not chats or (not db.dirty and not force) or is_empty():
         return
     async with _lock:
         db.dirty = False
         path, meta = make_backup()
         try:
-            today = db.now().date().isoformat()
-            msg_id = _auto["msg_id"]
-            if msg_id and _auto["day"] == today:
+            for cid in chats:
                 try:
-                    await bot.edit_message_media(
-                        InputMediaDocument(media=FSInputFile(path, filename=path.name), caption=_caption(meta)),
-                        chat_id=BACKUP_CHAT_ID, message_id=msg_id)
-                    return
+                    await _save_to(bot, cid, path, meta)
                 except Exception as e:  # noqa: BLE001
-                    if "not modified" in str(e):
-                        return
-                    log.warning("autosave edit failed, sending new: %s", e)
-            # раз в день — новое сообщение (чтобы оно оставалось последним закреплённым), старое удаляем
-            m = await bot.send_document(BACKUP_CHAT_ID, FSInputFile(path, filename=path.name),
-                                        caption=_caption(meta), disable_notification=True)
-            try:
-                await bot.pin_chat_message(BACKUP_CHAT_ID, m.message_id, disable_notification=True)
-            except Exception as e:  # noqa: BLE001
-                log.warning("pin failed: %s", e)
-            if msg_id and msg_id != m.message_id:
-                try:
-                    await bot.delete_message(BACKUP_CHAT_ID, msg_id)
-                except Exception:
-                    pass
-            _auto["msg_id"], _auto["day"] = m.message_id, today
-        except Exception as e:  # noqa: BLE001
-            db.dirty = True
-            log.exception("autosave failed: %s", e)
+                    db.dirty = True
+                    log.exception("autosave to %s failed: %s", cid, e)
         finally:
             shutil.rmtree(path.parent, ignore_errors=True)
 
@@ -256,20 +291,28 @@ async def autosave_loop(bot: Bot) -> None:
 
 
 async def startup_restore(bot: Bot) -> str | None:
-    """При запуске: запоминает закреплённую автокопию; если база пустая — восстанавливает из неё.
+    """При запуске: запоминает закреплённые автокопии; если база пустая — восстанавливает из самой свежей.
     Возвращает дату копии, если восстановление произошло."""
-    pm = await find_pinned(bot)
-    if pm and pm.from_user and pm.from_user.is_bot:
-        _auto["msg_id"] = pm.message_id
-        _auto["day"] = None  # первое сохранение после запуска — новым сообщением
-    if not pm or not is_empty():
+    found = []
+    for cid in restore_candidates():
+        pm = await find_pinned(bot, cid)
+        if pm:
+            found.append((pm.document.file_name, cid, pm))
+            if pm.from_user and pm.from_user.is_bot and cid in autosave_chats():
+                _auto[cid] = {"msg_id": pm.message_id, "day": None}
+    if not found or not is_empty():
         return None
-    tmp = DATA_DIR / "autorestore.zip"
-    await bot.download(pm.document, destination=tmp)
-    try:
-        meta = inspect(tmp)
-        restore(tmp)
-        db.dirty = False
-        return str(meta.get("created_at", "?"))[:16]
-    finally:
-        tmp.unlink(missing_ok=True)
+    found.sort(key=lambda x: x[0], reverse=True)   # имя содержит дату и время: самая свежая — первая
+    for _, cid, pm in found:
+        tmp = DATA_DIR / "autorestore.zip"
+        try:
+            await bot.download(pm.document, destination=tmp)
+            meta = inspect(tmp)
+            restore(tmp)
+            db.dirty = False
+            return str(meta.get("created_at", "?"))[:16]
+        except Exception as e:  # noqa: BLE001
+            log.warning("restore from %s failed: %s", cid, e)
+        finally:
+            tmp.unlink(missing_ok=True)
+    return None

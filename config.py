@@ -21,7 +21,8 @@ def _load_env() -> None:
 _load_env()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMIN_IDS = {int(x) for x in re.split(r"[,\s;]+", os.getenv("ADMIN_IDS", "")) if x.strip().isdigit()}
+ADMIN_LIST = [int(x) for x in re.split(r"[,\s;]+", os.getenv("ADMIN_IDS", "")) if x.strip().isdigit()]  # в порядке из настройки
+ADMIN_IDS = set(ADMIN_LIST)
 TZ = ZoneInfo(os.getenv("TZ_NAME", "Europe/Moscow"))
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data")))
 DB_PATH = DATA_DIR / "bot.db"
