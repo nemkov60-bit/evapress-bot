@@ -8,7 +8,7 @@ from aiogram import Bot, F, Router
 from aiogram.filters import BaseFilter, Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, FSInputFile, InputMediaPhoto, Message, ReplyKeyboardRemove
+from aiogram.types import CallbackQuery, ChatMemberUpdated, FSInputFile, InputMediaPhoto, Message, ReplyKeyboardRemove
 
 import backup
 import db
@@ -78,8 +78,8 @@ HELP = (
 CUSTOMER_HELP = (
     "<b>Справка</b>\n\n"
     "📊 <b>Статистика</b> — /stats, /stats 04.11.2026, /stats 1 6 14\n"
-    "📑 <b>Отчёт</b> — /report 04.11.2026 14 или через кнопку; в отчёте есть кнопка «Фото по маршруту».\n"
-    "📤 <b>Выгрузить Excel</b> — /export или /export 04.11.2026."
+    "📑 <b>Отчёт</b> — /report 04.11.2026 14 или через кнопку. В отчёте по маршруту есть кнопки "
+    "«🖼 Фото по маршруту» и «📝 Примечания к маршруту» (только просмотр)."
 )
 
 
@@ -120,7 +120,7 @@ async def cmd_start(message: Message, state: FSMContext):
                              "Справка: /help", reply_markup=ADMIN_KB)
     else:
         await message.answer("👋 Добро пожаловать!\n"
-                             "Здесь вы можете смотреть статистику, отчёты и выгружать Excel по маршрутам.\n"
+                             "Здесь вы можете смотреть статистику и отчёты по маршрутам.\n"
                              "Справка: /help", reply_markup=my_kb(message.from_user.id))
 
 
@@ -230,7 +230,7 @@ async def cb_date(cb: CallbackQuery):
     if not wb:
         await cb.message.answer("Файл не найден.")
         return
-    if act in ("as", "zq") and not is_admin(cb.from_user.id):
+    if act in ("as", "zq", "ex") and not is_admin(cb.from_user.id):
         await cb.message.answer("Недостаточно прав.")
         return
     if act == "nt" and not is_admin(cb.from_user.id):
@@ -399,8 +399,7 @@ async def cmd_report(message: Message, command: CommandObject, state: FSMContext
 
 def report_kb(uid: int, r):
     rows = [[("🖼 Фото по маршруту", f"ph:{r['id']}")]]
-    if is_admin(uid):
-        rows.append([("📝 Примечания к маршруту", f"ntr:{r['id']}")])
+    rows.append([("📝 Примечания к маршруту", f"ntr:{r['id']}")])  # заказчику — только просмотр
     if r["closed_at"] and is_admin(uid):
         rows.append([("↩️ Открыть маршрут снова", f"rro:{r['id']}")])
     elif r["close_req_at"] and is_admin(uid):
@@ -539,13 +538,13 @@ async def cb_photos(cb: CallbackQuery, bot: Bot):
 
 # ------------------------------------------------------------ export ------
 
-@router.message(F.text == A_EXPORT)
+@router.message(F.text == A_EXPORT, ADM)
 async def export_btn(message: Message, state: FSMContext):
     await state.clear()
     await choose_date_or_run(message, "ex", send_export)
 
 
-@router.message(Command("export"))
+@router.message(Command("export"), ADM)
 async def cmd_export(message: Message, command: CommandObject, state: FSMContext):
     await state.clear()
     d, _ = split_date_args(command.args)
@@ -1105,9 +1104,11 @@ def note_target(n) -> str:
     return f"{p['network']} — {p['address']}" if p else n["point_key"].split(":", 1)[1]
 
 
-@router.callback_query(F.data.startswith("ntr:"), ADM)
+@router.callback_query(F.data.startswith("ntr:"))
 async def cb_route_notes(cb: CallbackQuery):
+    """Список примечаний маршрута. Администратор может добавлять и удалять, заказчик — только смотреть."""
     rid = int(cb.data[4:])
+    admin = is_admin(cb.from_user.id)
     r = S.route_with_wb(rid)
     await cb.answer()
     lines = [f"📝 <b>Примечания: маршрут №{h(r['route_no'])}, {S.fmt_date(r['work_date'])}</b>", ""]
@@ -1116,7 +1117,8 @@ async def cb_route_notes(cb: CallbackQuery):
     if rn:
         lines.append("<b>К маршруту в целом:</b>")
         for n in rn:
-            lines.append(f"• [{n['id']}] {n['text']} <i>({N.when(n)})</i>")
+            lines.append(f"• [{n['id']}] {n['text']} <i>({N.when(n)})</i>" if admin
+                         else f"• {n['text']} <i>({N.when(n)})</i>")
             rows.append([(f"🗑 Удалить [{n['id']}]", f"ndl:{n['id']}")])
     for p in db.q("SELECT * FROM points WHERE route_id=? ORDER BY seq", (rid,)):
         pn = N.for_point(p, r["work_date"])
@@ -1125,10 +1127,14 @@ async def cb_route_notes(cb: CallbackQuery):
         lines.append(f"\n<b>{p['seq']}. {h(short(p['address'], 60))}</b>")
         for n in pn:
             who = "❗ логист" if n["author_role"] == "admin" else f"📝 {h(S.driver_name(n['author_id']))}"
-            lines.append(f"• [{n['id']}] {n['text']} <i>({who}, {N.when(n)})</i>")
+            lines.append(f"• [{n['id']}] {n['text']} <i>({who}, {N.when(n)})</i>" if admin
+                         else f"• {n['text']} <i>({who}, {N.when(n)})</i>")
             rows.append([(f"🗑 Удалить [{n['id']}]", f"ndl:{n['id']}")])
     if len(lines) == 2:
         lines.append("Примечаний пока нет.")
+    if not admin:
+        await send_content(cb.bot, cb.message.chat.id, "\n".join(lines))
+        return
     rows.append([("➕ Примечание к маршруту", f"nar:{rid}"), ("➕ К адресу", f"npl:{rid}")])
     await send_content(cb.bot, cb.message.chat.id, "\n".join(lines), reply_markup=ikb(rows))
 
@@ -1325,6 +1331,65 @@ async def problem_text_save(message: Message, state: FSMContext):
     db.set_setting("problem_help", message.html_text)
     await state.clear()
     await message.answer("✅ Памятка обновлена.", reply_markup=ADMIN_KB)
+
+
+@router.my_chat_member()
+async def bot_added_to_chat(event: ChatMemberUpdated, bot: Bot):
+    """Бота добавили в канал/группу — сообщаем администратору ID (для BACKUP_CHAT_ID)."""
+    if event.chat.type == "private" or not is_admin(event.from_user.id):
+        return
+    status = event.new_chat_member.status
+    title = h(event.chat.title or "")
+    if status == "administrator":
+        text = (f"✅ Бот стал администратором в «{title}».\nID этого чата: <code>{event.chat.id}</code>\n\n"
+                f"Сохранять сюда резервные копии ({', '.join(backup.BACKUP_TIMES)} ежедневно)?")
+        try:
+            await bot.send_message(event.from_user.id, text,
+                                   reply_markup=ikb([[("💾 Да, сохранять копии сюда", f"bkc:{event.chat.id}")]]))
+        except Exception:
+            pass
+        return
+    elif status in ("member", "restricted"):
+        text = (f"ℹ️ Бота добавили в «{title}» (ID <code>{event.chat.id}</code>), но не администратором — "
+                f"для автокопии сделайте его администратором с правом публиковать и закреплять сообщения.")
+    else:
+        return
+    try:
+        await bot.send_message(event.from_user.id, text)
+    except Exception:
+        pass
+
+
+@router.message(F.forward_origin.chat, ADM)
+async def forwarded_from_chat(message: Message):
+    """Переслали боту сообщение из канала — показываем ID канала."""
+    chat = message.forward_origin.chat
+    cur = backup.channel_id()
+    note = "\n✅ Это уже канал резервных копий." if cur == chat.id else ""
+    await message.answer(f"ID канала «{h(chat.title or '')}»: <code>{chat.id}</code>{note}",
+                         reply_markup=None if note else ikb([[("💾 Сохранять резервные копии в этот канал",
+                                                                f"bkc:{chat.id}")]]))
+
+
+@router.callback_query(F.data.startswith("bkc:"), ADM)
+async def cb_backup_channel(cb: CallbackQuery, bot: Bot):
+    cid = int(cb.data[4:])
+    await cb.answer("Проверяю…")
+    errors = await backup.send_backup(bot, "проверка канала", {cid})
+    if errors:
+        await cb.message.answer(f"❌ Бот не смог отправить файл в канал: {h(errors[0][:300])}\n\n"
+                                f"Проверьте, что бот — администратор канала с правом публиковать сообщения.")
+        return
+    db.set_setting("backup_channel_id", str(cid))
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    times = " и ".join(backup.BACKUP_TIMES)
+    await cb.message.answer(f"✅ Канал подключён: первая копия уже в нём.\n"
+                            f"Дальше копии будут приходить туда каждый день в {times}.\n\n"
+                            f"Для надёжности добавьте на BotHost переменную <code>BACKUP_CHAT_ID={cid}</code>: "
+                            f"тогда канал не «забудется», даже если хостинг сотрёт данные бота.")
 
 
 @router.callback_query()

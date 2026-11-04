@@ -1,8 +1,8 @@
 """Резервные копии данных бота в Telegram и восстановление из них.
 
 Копия = zip с базой bot.db (все пользователи, маршруты, точки, ссылки на фото, примечания, заметки,
-инструкции, настройки) и исходными Excel-файлами. Каждый день в BACKUP_TIME бот присылает копию
-администраторам из ADMIN_IDS. Даже если хостинг потеряет файлы, данные восстанавливаются из последней копии.
+инструкции, настройки) и исходными Excel-файлами. В BACKUP_TIMES (по умолчанию 09:00 и 21:00) бот присылает
+копию в канал резервных копий, а если канал не подключён — администраторам из ADMIN_IDS. Даже если хостинг потеряет файлы, данные восстанавливаются из последней копии.
 Фото хранятся на серверах Telegram, в копии — ссылки на них, поэтому архив маленький.
 """
 from __future__ import annotations
@@ -21,7 +21,7 @@ from aiogram import Bot
 from aiogram.types import FSInputFile
 
 import db
-from config import ADMIN_IDS, BACKUP_TIME, DATA_DIR, DB_PATH, WB_DIR
+from config import ADMIN_IDS, BACKUP_CHANNEL_ID, BACKUP_TIMES, DATA_DIR, DB_PATH, WB_DIR
 
 PREFIX = "evapress_backup_"
 MAX_SIZE = 45 * 1024 * 1024
@@ -71,39 +71,62 @@ def make_backup() -> tuple[Path, dict]:
     return path, meta
 
 
-async def send_backup(bot: Bot, reason: str, chat_ids: set[int] | None = None) -> None:
+def channel_id() -> int | None:
+    """Канал резервных копий: из BACKUP_CHAT_ID или подключённый кнопкой в боте."""
+    if BACKUP_CHANNEL_ID:
+        return BACKUP_CHANNEL_ID
+    v = db.get_setting("backup_channel_id")
+    return int(v) if v.lstrip("-").isdigit() else None
+
+
+async def send_backup(bot: Bot, reason: str, chat_ids: set[int] | None = None) -> list[str]:
+    """Отправляет копию; возвращает список ошибок (пустой — всё доставлено)."""
     path, meta = make_backup()
+    errors = []
     try:
         c = meta["counts"]
         caption = (f"💾 Резервная копия данных бота ({reason})\n"
                    f"{meta['created_at'][:16]}: " + ", ".join(f"{k}: {v}" for k, v in c.items()) +
-                   "\n\nСохраните файл. Восстановление: отправьте его боту с подписью /restore")
+                   "\n\nВосстановление: отправьте этот файл боту.")
         for cid in (chat_ids or ADMIN_IDS):
             try:
                 await bot.send_document(cid, FSInputFile(path, filename=path.name), caption=caption,
                                         disable_notification=True)
             except Exception as e:  # noqa: BLE001
                 log.warning("backup to %s failed: %s", cid, e)
+                errors.append(f"{cid}: {e}")
     finally:
         shutil.rmtree(path.parent, ignore_errors=True)
+    return errors
+
+
+def next_run(now: datetime) -> tuple[datetime, str]:
+    best = None
+    for t in BACKUP_TIMES:
+        hh, mm = map(int, t.split(":"))
+        cand = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if cand <= now:
+            cand += timedelta(days=1)
+        if best is None or cand < best[0]:
+            best = (cand, f"{hh:02d}:{mm:02d}")
+    return best
 
 
 async def daily_loop(bot: Bot) -> None:
-    """Ежедневная копия в BACKUP_TIME (по часовому поясу бота)."""
-    if not BACKUP_TIME:
+    """Плановые копии в BACKUP_TIMES (по часовому поясу бота) — в канал или администраторам."""
+    if not BACKUP_TIMES:
         return
-    hh, mm = map(int, BACKUP_TIME.split(":"))
     while True:
-        now = db.now()
-        nxt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        if nxt <= now:
-            nxt += timedelta(days=1)
-        await asyncio.sleep((nxt - now).total_seconds())
+        nxt, label = next_run(db.now())
+        await asyncio.sleep((nxt - db.now()).total_seconds())
         try:
             if not is_empty():
-                await send_backup(bot, "ежедневная")
+                ch = channel_id()
+                errors = await send_backup(bot, f"плановая, {label}", {ch} if ch else None)
+                if ch and errors:  # канал недоступен — чтобы копия не потерялась, шлём администраторам
+                    await send_backup(bot, f"плановая, {label}; канал недоступен: {errors[0][:150]}")
         except Exception as e:  # noqa: BLE001
-            log.exception("daily backup failed: %s", e)
+            log.exception("scheduled backup failed: %s", e)
         await asyncio.sleep(61)
 
 
