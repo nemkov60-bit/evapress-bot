@@ -10,6 +10,7 @@ from aiogram.types import CallbackQuery, InputMediaDocument, InputMediaPhoto, In
 
 import acks
 import db
+import geo
 import notes as N
 import services as S
 from common import ROLE_NAMES, admin_ids, extract_content, notify_admins, role_of, send_content, send_poster, user_label
@@ -137,7 +138,7 @@ def point_view(p):
     r = S.route_with_wb(p["route_id"])
     block = N.point_block(p, r["work_date"])
     text = S.point_text(p, r) + ("\n\n" + block if block else "")
-    rows = [[("🧭 Маршрут до точки", N.nav_url(p))]]
+    rows = [[("🧭 Маршрут до точки", f"nav:{p['id']}")]]
     if p["status"] != "closed":
         rows.append([("📍 Открыть точку", f"po:{p['id']}")])
     rows.append([("⚠️ Проблема на адресе", f"pp:{p['id']}")])
@@ -568,6 +569,16 @@ async def after_point_closed(bot: Bot, rid: int) -> bool:
                              f"все точки закрыты ({c} из {t}). Водитель: {h(S.driver_name(r['driver_id']))}.",
                         reply_markup=ikb([[("↩️ Открыть маршрут снова", f"rro:{rid}")]]))
     return True
+
+
+@router.callback_query(F.data.startswith("nav:"))
+async def cb_nav(cb: CallbackQuery, bot: Bot):
+    p = own_point(cb.from_user.id, int(cb.data[4:]))
+    if not p:
+        await cb.answer("Точка недоступна", show_alert=True)
+        return
+    await cb.answer("Ищу точку на карте…")
+    await geo.send_nav(bot, cb.message.chat.id, p)
 
 
 # ------------------------------------------------------------ close point w/o photos

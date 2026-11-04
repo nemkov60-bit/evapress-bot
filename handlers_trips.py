@@ -12,6 +12,7 @@ from aiogram.types import CallbackQuery, Message
 
 import backup
 import db
+import geo
 import notes as N
 import services as S
 from common import is_admin, send_poster, user_label
@@ -229,10 +230,11 @@ def admin_point_card(pid: int):
         rows.append([("✅ Закрыть точку", f"apx:{pid}")])
     elif p["status"] == "closed":
         rows.append([("↩️ Открыть точку снова", f"apo:{pid}")])
-    g = N.geo(p)
-    text += ("\n🧭 Точка на карте: указана" if g else
-             "\n🧭 Точка на карте не указана — маршрут строится по тексту адреса")
-    rows.append([("🧭 Маршрут до точки", N.nav_url(p)), ("📍 Указать на карте", f"agl:{pid}")])
+    c = geo.cached(p)
+    text += ("\n🧭 Точка на карте: указана логистом" if c and c[2] == "admin" else
+             "\n🧭 Точка на карте: найдена автоматически по адресу (проверьте кнопкой «Маршрут»)" if c else
+             "\n🧭 Точка на карте: ещё не найдена")
+    rows.append([("🧭 Маршрут до точки", f"nav:{pid}"), ("📍 Указать на карте", f"agl:{pid}")])
     rows.append([("⬅️ К точкам маршрута", f"rpts:{p['route_id']}")])
     return text, ikb(rows)
 
@@ -359,6 +361,13 @@ async def cb_admin_reopen_point(cb: CallbackQuery):
     text, markup = admin_point_card(pid)
     await cb.message.answer(("↩️ Точка снова открыта" + (", маршрут тоже открыт" if r["closed_at"] else "") + ".\n\n")
                             + text, reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("nav:"), ADM)
+async def cb_admin_nav(cb: CallbackQuery, bot: Bot):
+    p = db.q1("SELECT * FROM points WHERE id=?", (int(cb.data[4:]),))
+    await cb.answer("Ищу точку на карте…")
+    await geo.send_nav(bot, cb.message.chat.id, p)
 
 
 @router.callback_query(F.data.startswith("agl:"), ADM)

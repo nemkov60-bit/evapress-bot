@@ -13,6 +13,7 @@ from aiogram.types import CallbackQuery, ChatMemberUpdated, FSInputFile, InputMe
 import acks
 import backup
 import db
+import geo
 import notes as N
 import services as S
 import zipper
@@ -216,6 +217,7 @@ async def do_import(message: Message, tmp: Path, name: str, d: date):
             f"Маршруты (точек): {routes}")
     if res["replaced"]:
         text += f"\nСохранено закрытых точек: {res['kept_closed']}"
+    asyncio.create_task(geo.prefetch(wb["id"]))  # координаты адресов для «Маршрут до точки» — в фоне
     await message.answer(text, reply_markup=ikb([[("🧭 Назначить маршруты", f"wd:as:{wb['id']}")],
                                                  [("✏️ Переименовать рейс", f"tn:{wb['id']}")]]))
     await message.answer("Меню:", reply_markup=ADMIN_KB)
