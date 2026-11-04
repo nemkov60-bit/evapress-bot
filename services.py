@@ -90,9 +90,39 @@ def driver_name(uid: int | None) -> str:
     return u["full_name"] if u else f"id {uid}"
 
 
-def drivers() -> list:
-    return [u for u in db.q("SELECT * FROM users WHERE active=1 AND COALESCE(role,'driver')='driver' "
-                            "ORDER BY full_name") if u["tg_id"] not in ADMIN_IDS]
+def drivers(online_only: bool = False) -> list:
+    """Водители. online_only — только с Telegram (для рассылок и ознакомления с инструкциями)."""
+    res = [u for u in db.q("SELECT * FROM users WHERE active=1 AND COALESCE(role,'driver')='driver' "
+                           "ORDER BY full_name") if u["tg_id"] not in ADMIN_IDS]
+    return [u for u in res if not u["offline"]] if online_only else res
+
+
+def is_offline(uid: int | None) -> bool:
+    if not uid:
+        return False
+    u = db.q1("SELECT offline FROM users WHERE tg_id=?", (uid,))
+    return bool(u and u["offline"])
+
+
+def create_offline_driver(name: str) -> int:
+    """Водитель без Telegram: условный отрицательный ID, чтобы не пересечься с реальными."""
+    low = db.q1("SELECT MIN(tg_id) m FROM users")["m"]
+    uid = min(-1, (low or 0) - 1)
+    db.x("INSERT INTO users(tg_id, full_name, role, offline, created_at) VALUES(?,?,'driver',1,?)",
+         (uid, name, db.now_s()))
+    return uid
+
+
+def merge_offline(old: int, new: int) -> None:
+    """Водитель без Telegram получил Telegram: вся его история переходит на настоящий ID."""
+    for table, col in (("routes", "driver_id"), ("routes", "close_req_by"), ("points", "closed_by"),
+                       ("points", "close_req_by"), ("problems", "driver_id"), ("photos", "driver_id"),
+                       ("notes", "author_id"), ("msg_deliveries", "user_id"), ("instr_acks", "user_id")):
+        try:
+            db.x(f"UPDATE OR IGNORE {table} SET {col}=? WHERE {col}=?", (new, old))
+        except Exception:
+            pass
+    db.x("DELETE FROM users WHERE tg_id=?", (old,))
 
 
 def users_by_role() -> dict[str, list]:
@@ -110,11 +140,11 @@ def users_by_role() -> dict[str, list]:
 INVITE_DAYS = 7
 
 
-def create_invite(role: str, admin_id: int) -> str:
+def create_invite(role: str, admin_id: int, merge_uid: int | None = None) -> str:
     code = secrets.token_urlsafe(9)
     expires = (db.now() + timedelta(days=INVITE_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
-    db.x("INSERT INTO invites(code, role, created_by, created_at, expires_at) VALUES(?,?,?,?,?)",
-         (code, role, admin_id, db.now_s(), expires))
+    db.x("INSERT INTO invites(code, role, created_by, created_at, expires_at, merge_uid) VALUES(?,?,?,?,?,?)",
+         (code, role, admin_id, db.now_s(), expires, merge_uid))
     return code
 
 

@@ -52,6 +52,8 @@ class Adm(StatesGroup):
     problem_text = State()
     reject_reason = State()
     note_text = State()
+    offline_name = State()
+    offline_rename = State()
 
 
 HELP = (
@@ -283,7 +285,8 @@ async def cb_assign_route(cb: CallbackQuery):
     for d in drv:
         mark = "✔️ " if d["tg_id"] == r["driver_id"] else ""
         extra = f" [№{busy[d['tg_id']]}]" if d["tg_id"] in busy and d["tg_id"] != r["driver_id"] else ""
-        rows.append([(f"{mark}{short(d['full_name'], 40)}{extra}", f"ad:{rid}:{d['tg_id']}")])
+        off = "📵 " if d["offline"] else ""
+        rows.append([(f"{mark}{off}{short(d['full_name'], 40)}{extra}", f"ad:{rid}:{d['tg_id']}")])
     rows.append([("🚫 Снять назначение", f"ad:{rid}:0")])
     rows.append([("⬅️ Назад", f"wd:as:{r['workbook_id']}")])
     await cb.answer()
@@ -299,14 +302,15 @@ async def cb_assign_driver(cb: CallbackQuery, bot: Bot):
     prev = r["driver_id"]
     db.x("UPDATE routes SET driver_id=?, assigned_at=? WHERE id=?", (uid or None, db.now_s(), rid))
     await cb.answer("Сохранено")
-    if uid and uid != prev:
+    if uid and uid != prev and not S.is_offline(uid):
         c, t = S.route_counts(rid)
         try:
             await bot.send_message(uid, f"🗺 Вам назначен маршрут <b>№{h(r['route_no'])}</b> на "
                                         f"<b>{S.route_title(r)}</b>, точек: {t}.\n"
                                         f"Нажмите «🚚 Начать маршрут», когда будете готовы.")
         except Exception:
-            await cb.message.answer("⚠️ Не удалось уведомить водителя (он не запускал бота?).")
+            if not S.is_offline(uid):
+                await cb.message.answer("⚠️ Не удалось уведомить водителя (он не запускал бота?).")
     if prev and prev != uid:
         try:
             await bot.send_message(prev, f"ℹ️ Маршрут №{h(r['route_no'])} (рейс {S.route_title(r)}) "
@@ -710,7 +714,7 @@ def active_driver_ids() -> list[int]:
     if not wb:
         return []
     return [r["driver_id"] for r in db.q("SELECT DISTINCT driver_id FROM routes WHERE workbook_id=? "
-                                         "AND driver_id IS NOT NULL", (wb["id"],))]
+                                         "AND driver_id > 0", (wb["id"],))]   # < 0 — водители без Telegram
 
 
 @router.message(F.text == A_MSG, ADM)
@@ -719,7 +723,7 @@ async def msg_menu(message: Message, state: FSMContext):
     rows = [[("🚚 Всем водителям на маршрутах (текущая дата)", "mt:active")],
             [("👥 Всем зарегистрированным водителям", "mt:all")]]
     act = set(active_driver_ids())
-    for d in S.drivers():
+    for d in S.drivers(online_only=True):
         rows.append([(("🚚 " if d["tg_id"] in act else "") + short(d["full_name"], 45), f"mt:{d['tg_id']}")])
     await message.answer("✉️ Кому отправить инструкцию / сообщение?", reply_markup=ikb(rows))
 
@@ -730,7 +734,7 @@ async def cb_msg_target(cb: CallbackQuery, state: FSMContext):
     if target == "active":
         ids, label = active_driver_ids(), "всем водителям на маршрутах"
     elif target == "all":
-        ids, label = [d["tg_id"] for d in S.drivers()], "всем водителям"
+        ids, label = [d["tg_id"] for d in S.drivers(online_only=True)], "всем водителям"
     else:
         ids, label = [int(target)], S.driver_name(int(target))
     if not ids:
@@ -808,6 +812,7 @@ async def users_menu(message: Message, state: FSMContext):
         for u in groups.get(role, []):
             rows.append([(f"{ROLE_ICON[role]} {short(u['full_name'], 45)}", f"u:{u['tg_id']}")])
     rows.append([("🎟 Пригласить", "inv"), ("📋 Активные приглашения", "invl")])
+    rows.append([("➕ Водитель без Telegram", "uoff")])
     await send_content(message.bot, message.chat.id, "\n".join(lines))
     await message.answer("Нажмите на пользователя, чтобы сменить роль или удалить его:", reply_markup=ikb(rows))
 
@@ -821,6 +826,15 @@ async def cb_user(cb: CallbackQuery):
         await cb.message.answer("Пользователь не найден.")
         return
     role = u["role"] or "driver"
+    if u["offline"]:
+        await cb.message.answer(
+            f"🚚 <b>{h(u['full_name'])}</b> — водитель без Telegram\n"
+            f"Назначайте ему маршруты как обычно, а точки отмечайте и фото загружайте сами: «🗂 Рейсы» → рейс → "
+            f"«🛣 Маршруты и точки» → маршрут. В отчётах и статистике точки будут закрыты на его имя.\n\n"
+            f"Если у водителя появится Telegram — создайте приглашение: после регистрации вся история перейдёт к нему.",
+            reply_markup=ikb([[("✏️ Изменить ФИО", f"uor:{uid}"), ("🎟 Приглашение в Telegram", f"uoi:{uid}")],
+                              [("🗑 Удалить", f"dd:{uid}"), ("Отмена", "noop")]]))
+        return
     rows = [[(f"→ {ROLE_NAMES[r]}", f"ur:{uid}:{r}") for r in ("driver", "customer", "admin") if r != role]]
     rows.append([("🗑 Удалить", f"dd:{uid}"), ("Отмена", "noop")])
     note = "\n\n⚠️ Это вы. Изменить свою роль или удалить себя нельзя." if uid == cb.from_user.id else ""
@@ -828,6 +842,60 @@ async def cb_user(cb: CallbackQuery):
         note += "\nℹ️ Этот ID указан в ADMIN_IDS — он остаётся администратором при любой роли здесь."
     await cb.message.answer(f"{ROLE_ICON[role]} {user_label(uid)}\nРоль: <b>{ROLE_NAMES[role]}</b>{note}",
                             reply_markup=None if uid == cb.from_user.id else ikb(rows))
+
+
+@router.callback_query(F.data == "uoff", ADM)
+async def cb_offline_new(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await state.set_state(Adm.offline_name)
+    await cb.message.answer("➕ <b>Водитель без Telegram</b>\nВведите Фамилию и Имя водителя (как в отчётах):",
+                            reply_markup=CANCEL_KB)
+
+
+@router.message(Adm.offline_name, F.text, NOT_MENU, ADM)
+async def offline_name_save(message: Message, state: FSMContext):
+    name = " ".join(message.text.split())
+    if len(name.split()) < 2:
+        await message.answer("Введите Фамилию и Имя, например: <i>Иванов Иван</i>")
+        return
+    await state.clear()
+    uid = S.create_offline_driver(name)
+    await message.answer(f"✅ Водитель <b>{h(name)}</b> добавлен (без Telegram).\n"
+                         f"Он появится в «🧭 Назначить маршруты». Точки по его маршрутам отмечайте в "
+                         f"«🗂 Рейсы» → рейс → «🛣 Маршруты и точки».", reply_markup=ADMIN_KB)
+
+
+@router.callback_query(F.data.startswith("uor:"), ADM)
+async def cb_offline_rename(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await state.set_state(Adm.offline_rename)
+    await state.update_data(off_uid=int(cb.data[4:]))
+    await cb.message.answer("Введите новые Фамилию и Имя:", reply_markup=CANCEL_KB)
+
+
+@router.message(Adm.offline_rename, F.text, NOT_MENU, ADM)
+async def offline_rename_save(message: Message, state: FSMContext):
+    uid = (await state.get_data()).get("off_uid")
+    await state.clear()
+    name = " ".join(message.text.split())
+    db.x("UPDATE users SET full_name=? WHERE tg_id=? AND offline=1", (name, uid))
+    await message.answer(f"✅ ФИО изменено: <b>{h(name)}</b>", reply_markup=ADMIN_KB)
+
+
+@router.callback_query(F.data.startswith("uoi:"), ADM)
+async def cb_offline_invite(cb: CallbackQuery, bot: Bot):
+    uid = int(cb.data[4:])
+    u = db.q1("SELECT * FROM users WHERE tg_id=? AND offline=1", (uid,))
+    await cb.answer()
+    if not u:
+        await cb.message.answer("Водитель не найден.")
+        return
+    code = S.create_invite("driver", cb.from_user.id, merge_uid=uid)
+    me = await bot.me()
+    await cb.message.answer(f"🎟 Приглашение для <b>{h(u['full_name'])}</b> (одноразовое, {S.INVITE_DAYS} дней).\n"
+                            f"После регистрации по этой ссылке все его маршруты, закрытые точки и фото "
+                            f"перейдут на его Telegram.\n\nhttps://t.me/{me.username}?start=inv_{code}",
+                            reply_markup=ikb([[("🚫 Отозвать", f"ivr:{code}")]]))
 
 
 def _release_open_routes(uid: int) -> None:

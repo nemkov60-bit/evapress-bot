@@ -102,6 +102,8 @@ def user_label(uid: int) -> str:
     if not u:
         return f"id {uid}"
     s = h(u["full_name"])
+    if u["offline"]:
+        s += " (без Telegram)"
     if u["username"]:
         s += f" (@{h(u['username'])})"
     return s

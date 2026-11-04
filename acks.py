@@ -40,7 +40,7 @@ async def broadcast_instruction(bot: Bot, iid: int, edited: bool) -> tuple[int, 
     """Новую/изменённую инструкцию — всем водителям, кто с этой версией не ознакомлен."""
     i = db.q1("SELECT * FROM instructions WHERE id=?", (iid,))
     sent = 0
-    drivers = S.drivers()
+    drivers = S.drivers(online_only=True)
     for d in drivers:
         if S.instr_is_acked(iid, d["tg_id"]):
             continue
@@ -56,7 +56,7 @@ async def broadcast_instruction(bot: Bot, iid: int, edited: bool) -> tuple[int, 
 
 
 def instr_report() -> str:
-    drivers = S.drivers()
+    drivers = S.drivers(online_only=True)   # водители без Telegram не могут подтвердить ознакомление
     items = db.q("SELECT * FROM instructions ORDER BY id")
     if not items:
         return "Инструкций пока нет."

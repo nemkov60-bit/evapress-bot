@@ -228,6 +228,8 @@ async def reg_name(message: Message, state: FSMContext, bot: Bot):
          "ON CONFLICT(tg_id) DO UPDATE SET full_name=excluded.full_name, username=excluded.username, "
          "role=excluded.role, active=1",
          (message.from_user.id, name, message.from_user.username, role, db.now_s()))
+    if inv["merge_uid"]:  # водитель без Telegram получил Telegram — переносим его историю
+        S.merge_offline(inv["merge_uid"], message.from_user.id)
     hint = {
         "driver": f"Когда логист назначит вам маршрут, нажмите «{B_START}».",
         "customer": "Вам доступны статистика и отчёты по маршрутам. Справка: /help",
@@ -557,7 +559,7 @@ async def after_point_closed(bot: Bot, rid: int) -> bool:
         return False
     r = S.route_with_wb(rid)
     c, t = S.route_counts(rid)
-    if r["driver_id"]:
+    if r["driver_id"] and not S.is_offline(r["driver_id"]):
         try:
             await send_poster(bot, r["driver_id"], "thanks",
                               f"🏁 Все точки маршрута №{h(r['route_no'])} (рейс {h(S.route_title(r))}) закрыты — "

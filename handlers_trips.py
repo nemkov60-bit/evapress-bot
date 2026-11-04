@@ -28,6 +28,7 @@ class Trip(StatesGroup):
     rename = State()
     geo = State()            # админ указывает точку на карте (геопозиция)
     photo = State()          # админ загружает фото в точку
+    sheet = State()          # админ загружает фото маршрутного листа
     close_reason = State()   # причина закрытия точки без фото
 
 
@@ -143,7 +144,12 @@ def route_card(rid: int):
             f"Точек закрыто: <b>{c} из {t}</b>\n"
             f"📄 Фото маршрутного листа: {sheets or 'нет'}"
             + (f"\n⏳ Запросов на закрытие точек без фото: <b>{reqs}</b>" if reqs else ""))
+    if S.is_offline(r["driver_id"]):
+        text += ("\n\n📵 <b>Водитель без Telegram</b> — отмечайте точки и загружайте фото за него: "
+                 "«📍 Точки маршрута» → точка. Точки закрываются на его имя.")
     rows = [[("📍 Точки маршрута", f"rpts:{rid}")]]
+    if not r["closed_at"] and not r["wb_closed_at"]:
+        rows.append([("📄 Загрузить фото маршрутного листа", f"ash:{rid}")])
     if r["closed_at"]:
         rows.append([("↩️ Открыть маршрут снова", f"rro:{rid}")])
     elif not r["wb_closed_at"]:
@@ -153,10 +159,38 @@ def route_card(rid: int):
 
 
 @router.callback_query(F.data.startswith("rt:"), ADM)
-async def cb_route_card(cb: CallbackQuery):
+async def cb_route_card(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
     await cb.answer()
     text, markup = route_card(int(cb.data[3:]))
     await cb.message.answer(text, reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("ash:"), ADM)
+async def cb_admin_sheet(cb: CallbackQuery, state: FSMContext):
+    rid = int(cb.data[4:])
+    await cb.answer()
+    await state.set_state(Trip.sheet)
+    await state.update_data(sh_rid=rid)
+    await cb.message.answer("📄 Отправьте фото маршрутного листа (можно несколько страниц), затем нажмите «✅ Готово».",
+                            reply_markup=ikb([[("✅ Готово", f"rt:{rid}")]]))
+
+
+@router.message(Trip.sheet, F.photo | F.document, ADM)
+async def admin_sheet_photo(message: Message, state: FSMContext):
+    rid = (await state.get_data()).get("sh_rid")
+    r = S.route_with_wb(rid)
+    fid = message.photo[-1].file_id if message.photo else message.document.file_id
+    S.add_photo("sheet", fid, "photo" if message.photo else "document", r["driver_id"] or message.from_user.id,
+                route_id=rid, file_name=message.document.file_name if message.document else None)
+    if not r["started_at"] and S.is_offline(r["driver_id"]):
+        db.x("UPDATE routes SET started_at=? WHERE id=?", (db.now_s(), rid))
+
+    async def reply():
+        await message.answer(f"📄 Фото маршрутного листа сохранено (всего {len(S.sheet_photos(rid))}).",
+                             reply_markup=ikb([[("✅ Готово", f"rt:{rid}")]]))
+
+    debounce(message.from_user.id, reply)
 
 
 @router.callback_query(F.data.startswith("rcl:"), ADM)
@@ -213,7 +247,8 @@ def admin_point_card(pid: int):
     r = S.route_with_wb(p["route_id"])
     text = S.point_text(p, r)
     if p["status"] == "closed":
-        how = {"admin": "логистом", "approved": "по запросу водителя (подтверждено)", "driver": "водителем"}.get(
+        how = {"admin": "логистом", "approved": "по запросу водителя (подтверждено)", "driver": "водителем",
+               "admin_for_driver": "логистом со слов водителя"}.get(
             p["closed_via"] or "driver", "")
         text += f"\nЗакрыта {how}: {h(S.driver_name(p['closed_by']) if p['closed_by'] else '—')}"
     if p["close_note"]:
@@ -301,7 +336,14 @@ async def cb_admin_no_poa(cb: CallbackQuery):
 async def _finish_close(bot: Bot, message: Message, pid: int, admin_id: int, via: str, note: str | None):
     from handlers_driver import after_point_closed
     p = db.q1("SELECT * FROM points WHERE id=?", (pid,))
-    if not S.close_point(pid, admin_id, via, note):
+    rr = S.route_with_wb(p["route_id"])
+    who = admin_id
+    if S.is_offline(rr["driver_id"]):
+        # водитель без Telegram: точка закрывается на его имя, отмечено логистом
+        who, via = rr["driver_id"], "admin_for_driver"
+        if not rr["started_at"]:
+            db.x("UPDATE routes SET started_at=? WHERE id=?", (db.now_s(), rr["id"]))
+    if not S.close_point(pid, who, via, note):
         await message.answer("Точка уже закрыта.", reply_markup=ADMIN_KB)
         return
     r = S.route_with_wb(p["route_id"])
@@ -309,7 +351,7 @@ async def _finish_close(bot: Bot, message: Message, pid: int, admin_id: int, via
     await message.answer(f"✅ Точка {p['seq']}. {h(p['address'])} закрыта"
                          + (f" (без фото: {h(note)})" if note else "") + f". По маршруту: {c} из {t}.",
                          reply_markup=ADMIN_KB)
-    if r["driver_id"]:
+    if r["driver_id"] and not S.is_offline(r["driver_id"]):
         try:
             await bot.send_message(r["driver_id"], f"✅ Логист закрыл точку {p['seq']}. {h(p['address'])} "
                                                    f"(маршрут №{h(r['route_no'])}).")
