@@ -8,6 +8,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InputMediaDocument, InputMediaPhoto, InputMediaVideo, Message
 
+import acks
 import db
 import notes as N
 import services as S
@@ -32,6 +33,14 @@ class ProblemFlow(StatesGroup):
 
 class NoteFlow(StatesGroup):
     text = State()
+
+
+class SheetFlow(StatesGroup):
+    photo = State()        # фото маршрутного листа перед началом маршрута
+
+
+class PointReq(StatesGroup):
+    comment = State()      # причина закрытия точки без фото
 
 
 NOT_MENU = ~F.text.in_(DRIVER_BUTTONS | {CANCEL, B_SEND_PROBLEM})
@@ -105,11 +114,10 @@ def own_route(uid: int, rid: int):
 def route_view(rid: int):
     r = S.route_with_wb(rid)
     c, t = S.route_counts(rid)
-    text = (f"🗺 <b>Маршрут №{h(r['route_no'])} на {S.fmt_date(r['work_date'])}</b>\n"
+    text = (f"🗺 <b>Маршрут №{h(r['route_no'])}</b> · рейс {h(S.route_title(r))}\n"
             f"Закрыто точек: <b>{c} из {t}</b>\n"
-            + ("⏳ <b>Запрос на закрытие рейса отправлен логисту, ожидайте подтверждения.</b>\n"
-               if r["close_req_at"] else "")
-            + "\nНажмите на точку, чтобы посмотреть подробности и открыть её.")
+            + "\nНажмите на точку, чтобы посмотреть подробности и открыть её. "
+              "Когда все точки будут закрыты, маршрут закроется автоматически.")
     rblock = N.route_block(r["route_no"], r["work_date"])
     flagged = N.points_with_notes(rid, r["work_date"])
     if rblock:
@@ -118,12 +126,10 @@ def route_view(rid: int):
         text += "\n❗ — у точки есть важная информация или заметки водителей."
     rows = []
     for p in db.q("SELECT * FROM points WHERE route_id=? ORDER BY seq", (rid,)):
-        icon = "✅" if p["status"] == "closed" else ("🟡" if p["opened_at"] else "⬜")
+        icon = "✅" if p["status"] == "closed" else ("⏳" if p["close_req_at"] else ("🟡" if p["opened_at"] else "⬜"))
         mark = "❗" if p["id"] in flagged else ""
         rows.append([(f"{icon}{mark} {p['seq']}. {short(p['address'], 43)}", f"p:{p['id']}")])
     rows.append([("🔄 Обновить", f"r:{rid}")])
-    if not r["close_req_at"]:
-        rows.append([("🏁 Закрыть рейс", f"rc:{rid}")])
     return text, ikb(rows)
 
 
@@ -149,9 +155,14 @@ async def ask_step(message: Message, state: FSMContext, p):
         rows = []
         if step == "poa":
             rows.append([("🚫 Доверенность отсутствует", f"na:{p['id']}")])
+        if p["close_req_at"]:
+            req = "\n\n⏳ <i>Запрос на закрытие точки без фото отправлен логисту — ожидайте решения.</i>"
+        else:
+            req = ""
+            rows.append([("📨 Закрыть без фото (запрос логисту)", f"pq:{p['id']}")])
         rows.append([("⬅️ К списку точек", f"r:{p['route_id']}")])
-        await message.answer(f"<b>{h(short(p['address'], 80))}</b>\n\n{S.photos_progress(p)}\n\n{STEP_PROMPTS[step]}",
-                             reply_markup=ikb(rows))
+        await message.answer(f"<b>{h(short(p['address'], 80))}</b>\n\n{S.photos_progress(p)}\n\n{STEP_PROMPTS[step]}"
+                             + req, reply_markup=ikb(rows))
     else:
         # обязательные фото есть — остаёмся в режиме приёма: всё, что пришлёт водитель, — доп. фото
         await state.set_state(PointFlow.photo)
@@ -229,7 +240,9 @@ async def reg_name(message: Message, state: FSMContext, bot: Bot):
     if role == "driver":
         wb = S.latest_workbook()
         if wb and not wb["closed_at"]:
-            rows.insert(0, [(f"🧭 Назначить маршрут на {S.fmt_date(wb['work_date'])}", f"wd:as:{wb['id']}")])
+            rows.insert(0, [(f"🧭 Назначить маршрут: {S.wb_title(wb)}", f"wd:as:{wb['id']}")])
+    if role == "driver":
+        await acks.send_unacked(bot, uid, "📖 <b>Добро пожаловать! Ознакомьтесь с инструкциями для водителей.</b>")
     await notify_admins(bot, f"🆕 <b>Новый пользователь по приглашению</b>\n"
                              f"👤 {user_label(uid)}, ID <code>{uid}</code>\n"
                              f"Роль: <b>{ROLE_NAMES[role]}</b>\n"
@@ -263,24 +276,88 @@ async def cancel(message: Message, state: FSMContext):
 @router.message(F.text == B_START)
 async def start_route(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
-    routes = S.driver_routes(message.from_user.id)
+    uid = message.from_user.id
+    routes = S.driver_routes(uid)
     if not routes:
         await message.answer("На данный момент вам не назначен маршрут. Обратитесь к логисту.")
         return
-    if len(routes) > 1:
-        await message.answer("У вас несколько маршрутов. Выберите, какой начать:",
-                             reply_markup=ikb([[(f"№{r['route_no']} на {S.fmt_date(r['work_date'])}", f"rs:{r['id']}")]
-                                               for r in routes]))
+    # 1) перед началом рейса — ознакомиться со всеми новыми инструкциями
+    if await acks.send_unacked(bot, uid, "📖 <b>Перед началом рейса ознакомьтесь с инструкциями.</b>"):
+        await message.answer(f"После ознакомления со всеми инструкциями снова нажмите «{B_START}».")
         return
-    await begin_route(message, routes[0]["id"], message.from_user.id, bot)
+    # 2) фото маршрутного листа — по каждому маршруту
+    if await ask_next_sheet(message, state, uid):
+        return
+    # 3) все маршруты
+    for r in routes:
+        await begin_route(message, r["id"], uid, bot)
+
+
+async def ask_next_sheet(message: Message, state: FSMContext, uid: int) -> bool:
+    """Просит фото маршрутного листа для первого маршрута, где его нет. True — попросили."""
+    for r in S.driver_routes(uid):
+        if S.needs_sheet(r["id"]):
+            await state.set_state(SheetFlow.photo)
+            await state.update_data(sheet_rid=r["id"])
+            await message.answer(f"📄 <b>Маршрут №{h(r['route_no'])}</b> · рейс {h(S.route_title(r))}\n\n"
+                                 f"Сфотографируйте <b>маршрутный лист</b> и отправьте фото. Если лист на нескольких "
+                                 f"страницах — отправьте все.\n\n{PHOTO_HINT}")
+            return True
+    return False
+
+
+@router.message(SheetFlow.photo, F.photo | F.document)
+async def got_sheet_photo(message: Message, state: FSMContext, bot: Bot):
+    uid = message.from_user.id
+    rid = (await state.get_data()).get("sheet_rid")
+    r = own_route(uid, rid) if rid else None
+    if not r:
+        await state.clear()
+        await message.answer("Маршрут недоступен.")
+        return
+    fid, ftype, fname = media_of(message)
+    S.add_photo("sheet", fid, ftype, uid, route_id=rid, file_name=fname)
+
+    async def reply():
+        n = len(S.sheet_photos(rid))
+        await message.answer(f"📄 Фото маршрутного листа №{h(r['route_no'])} получено ({n}).\n"
+                             f"Если есть ещё страницы — отправьте их, затем нажмите «✅ Готово».",
+                             reply_markup=ikb([[("✅ Готово", f"shd:{rid}")]]))
+
+    debounce(uid, reply)
+
+
+@router.message(SheetFlow.photo, NOT_MENU)
+async def sheet_not_photo(message: Message):
+    await message.answer("Отправьте фото маршрутного листа.")
+
+
+@router.callback_query(F.data.startswith("shd:"))
+async def cb_sheet_done(cb: CallbackQuery, state: FSMContext, bot: Bot):
+    uid = cb.from_user.id
+    rid = int(cb.data[4:])
+    if not own_route(uid, rid) or not S.sheet_photos(rid):
+        await cb.answer("Сначала отправьте фото маршрутного листа", show_alert=True)
+        return
+    await cb.answer("Готово")
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await state.clear()
+    if await ask_next_sheet(cb.message, state, uid):
+        return
+    for r in S.driver_routes(uid):
+        await begin_route(cb.message, r["id"], uid, bot)
 
 
 async def begin_route(message: Message, rid: int, uid: int, bot: Bot):
     r = S.route_with_wb(rid)
     if not r["started_at"]:
         db.x("UPDATE routes SET started_at=? WHERE id=?", (db.now_s(), rid))
+        n = len(S.sheet_photos(rid))
         await notify_admins(bot, f"🚚 {user_label(uid)} начал маршрут №{h(r['route_no'])} "
-                                 f"({S.fmt_date(r['work_date'])})")
+                                 f"(рейс {h(S.route_title(r))})" + (f", фото маршрутного листа: {n}" if n else ""))
     text, markup = route_view(rid)
     await message.answer(text, reply_markup=markup)
 
@@ -292,6 +369,9 @@ async def cb_route_start(cb: CallbackQuery, bot: Bot):
         await cb.answer("Маршрут вам не назначен", show_alert=True)
         return
     await cb.answer()
+    if S.instr_unacked(cb.from_user.id) or S.needs_sheet(rid):
+        await cb.message.answer(f"Нажмите «{B_START}» — бот проведёт по шагам перед началом маршрута.")
+        return
     await begin_route(cb.message, rid, cb.from_user.id, bot)
 
 
@@ -343,6 +423,9 @@ async def cb_open_point(cb: CallbackQuery, state: FSMContext):
     p = own_point(cb.from_user.id, int(cb.data[3:]))
     if not p:
         await cb.answer("Точка недоступна: рейс закрыт или маршрут снят", show_alert=True)
+        return
+    if S.needs_sheet(p["route_id"]) or S.instr_unacked(cb.from_user.id):
+        await cb.answer(f"Сначала нажмите «{B_START}»: инструкции и фото маршрутного листа", show_alert=True)
         return
     if p["status"] == "closed":
         await cb.answer("Точка уже закрыта", show_alert=True)
@@ -452,7 +535,7 @@ async def cb_close(cb: CallbackQuery, state: FSMContext, bot: Bot):
         await cb.answer("Загрузите все фото перед закрытием точки", show_alert=True)
         await ask_step(cb.message, state, p)
         return
-    db.x("UPDATE points SET status='closed', closed_at=?, closed_by=? WHERE id=?", (db.now_s(), uid, p["id"]))
+    S.close_point(p["id"], uid, "driver")
     await state.clear()
     await cb.answer("Точка закрыта ✅")
     try:
@@ -462,16 +545,120 @@ async def cb_close(cb: CallbackQuery, state: FSMContext, bot: Bot):
     rid = p["route_id"]
     c, t = S.route_counts(rid)
     await cb.message.answer(f"✅ Точка <b>{h(short(p['address'], 80))}</b> закрыта. Закрыто {c} из {t}.")
-    if c == t:
-        r = S.route_with_wb(rid)
-        db.x("UPDATE routes SET finished_at=? WHERE id=?", (db.now_s(), rid))
-        await cb.message.answer("🎉 Все точки маршрута закрыты! Нажмите «🏁 Закрыть рейс», чтобы завершить маршрут.",
-                                reply_markup=ikb([[("🏁 Закрыть рейс", f"rc:{rid}")]]))
-        await notify_admins(bot, f"✅ {user_label(uid)} закрыл все точки маршрута №{h(r['route_no'])} "
-                                 f"({S.fmt_date(r['work_date'])}): {c} из {t}.")
-    else:
+    if not await after_point_closed(bot, rid):
         text, markup = route_view(rid)
         await cb.message.answer(text, reply_markup=markup)
+
+
+async def after_point_closed(bot: Bot, rid: int) -> bool:
+    """Если все точки закрыты — маршрут закрывается автоматически, водитель получает постер благодарности."""
+    if not S.auto_close_route(rid):
+        return False
+    r = S.route_with_wb(rid)
+    c, t = S.route_counts(rid)
+    if r["driver_id"]:
+        try:
+            await send_poster(bot, r["driver_id"], "thanks",
+                              f"🏁 Все точки маршрута №{h(r['route_no'])} (рейс {h(S.route_title(r))}) закрыты — "
+                              f"маршрут закрыт автоматически.\nЗакрыто точек: {c} из {t}.\n\n"
+                              f"Благодарим за отличную работу!", reply_markup=DRIVER_KB)
+        except Exception:
+            pass
+    await notify_admins(bot, f"🏁 Маршрут №{h(r['route_no'])} (рейс {h(S.route_title(r))}) закрыт автоматически: "
+                             f"все точки закрыты ({c} из {t}). Водитель: {h(S.driver_name(r['driver_id']))}.",
+                        reply_markup=ikb([[("↩️ Открыть маршрут снова", f"rro:{rid}")]]))
+    return True
+
+
+# ------------------------------------------------------------ close point w/o photos
+
+@router.callback_query(F.data.startswith("pq:"))
+async def cb_point_req(cb: CallbackQuery, state: FSMContext):
+    p = own_point(cb.from_user.id, int(cb.data[3:]))
+    if not p or p["status"] == "closed":
+        await cb.answer("Точка недоступна или уже закрыта", show_alert=True)
+        return
+    if p["close_req_at"]:
+        await cb.answer("Запрос уже отправлен, ожидайте решения логиста", show_alert=True)
+        return
+    await cb.answer()
+    await state.set_state(PointReq.comment)
+    await state.update_data(req_pid=p["id"])
+    await cb.message.answer(f"📨 <b>Запрос на закрытие точки без фото</b>\n{h(short(p['address'], 80))}\n\n"
+                            f"{S.photos_progress(p)}\n\n"
+                            f"Напишите <b>причину</b>, почему нельзя загрузить фото (обязательно). "
+                            f"Логист подтвердит или отклонит закрытие.", reply_markup=CANCEL_KB)
+
+
+@router.message(PointReq.comment, F.text, NOT_MENU)
+async def point_req_comment(message: Message, state: FSMContext, bot: Bot):
+    uid = message.from_user.id
+    text = message.text.strip()
+    if len(text) < 5:
+        await message.answer("Опишите причину подробнее (хотя бы несколько слов).")
+        return
+    pid = (await state.get_data()).get("req_pid")
+    await state.clear()
+    p = own_point(uid, pid)
+    if not p or not S.request_point_close(pid, uid, text):
+        await message.answer("Запрос уже отправлен или точка недоступна.", reply_markup=DRIVER_KB)
+        return
+    r = S.route_with_wb(p["route_id"])
+    await message.answer("⏳ Запрос отправлен логисту. Пока ждёте решения, можно продолжать маршрут.",
+                         reply_markup=DRIVER_KB)
+    await notify_admins(bot, f"📨 <b>Запрос на закрытие точки без фото</b>\n"
+                             f"👤 {user_label(uid)}\n"
+                             f"🗺 Маршрут №{h(r['route_no'])} · рейс {h(S.route_title(r))}\n"
+                             f"📍 {p['seq']}. {h(p['network'])} — {h(p['address'])}\n\n"
+                             f"{S.photos_progress(p)}\n\n💬 Причина: {h(text)}",
+                        reply_markup=ikb([[("✅ Подтвердить закрытие", f"pqa:{pid}")],
+                                          [("❌ Отклонить", f"pqr:{pid}")]]))
+    text_, markup = route_view(p["route_id"])
+    await message.answer(text_, reply_markup=markup)
+
+
+@router.message(PointReq.comment, NOT_MENU)
+async def point_req_not_text(message: Message):
+    await message.answer("Причину нужно написать текстом.")
+
+
+# ------------------------------------------------------------ acks --------
+
+@router.callback_query(F.data.startswith("iok:"))
+async def cb_instr_ack(cb: CallbackQuery):
+    uid = cb.from_user.id
+    iid = int(cb.data[4:])
+    if not db.q1("SELECT 1 FROM instructions WHERE id=?", (iid,)):
+        await cb.answer("Инструкция удалена")
+        return
+    S.instr_ack(iid, uid)
+    await cb.answer("Спасибо!")
+    try:
+        await cb.message.edit_reply_markup(reply_markup=ikb([[("✔️ Ознакомлен(а)", "noop_ack")]]))
+    except Exception:
+        pass
+    left = len(S.instr_unacked(uid))
+    if left == 0:
+        await cb.message.answer(f"✅ Вы ознакомились со всеми инструкциями. Теперь можно нажать «{B_START}».",
+                                reply_markup=DRIVER_KB)
+
+
+@router.callback_query(F.data.startswith("mk:"))
+async def cb_msg_ack(cb: CallbackQuery, bot: Bot):
+    mid = int(cb.data[3:])
+    ok = S.msg_ack(mid, cb.from_user.id)
+    await cb.answer("Получение подтверждено" if ok else "Уже подтверждено")
+    try:
+        await cb.message.edit_reply_markup(reply_markup=ikb([[("✔️ Получено", "noop_ack")]]))
+    except Exception:
+        pass
+    if ok:
+        await acks.refresh_summary(bot, mid)
+
+
+@router.callback_query(F.data == "noop_ack")
+async def cb_noop_ack(cb: CallbackQuery):
+    await cb.answer("Уже подтверждено")
 
 
 # ------------------------------------------------------------ close route -
@@ -652,7 +839,7 @@ async def problem_send(message: Message, state: FSMContext, bot: Bot):
     r = S.route_with_wb(rid) if rid else None
     head = (f"⚠️ <b>Проблема на адресе</b>\n"
             f"👤 {user_label(uid)}\n"
-            + (f"🗺 Маршрут №{h(r['route_no'])} ({S.fmt_date(r['work_date'])})\n" if r else "")
+            + (f"🗺 Маршрут №{h(r['route_no'])} · рейс {h(S.route_title(r))}\n" if r else "")
             + (f"📍 {p['seq']}. {h(p['network'])} — {h(p['address'])}\n" if p else "📍 без привязки к адресу\n")
             + (f"📷 Вложений: {len(files)}\n" if files else "")
             + f"\n{h(text) if text else '(без текста)'}")
@@ -714,12 +901,17 @@ async def problem_collect(message: Message, state: FSMContext):
 @router.message(F.text == B_INSTR)
 async def instructions(message: Message, state: FSMContext):
     await state.clear()
+    uid = message.from_user.id
     rows = db.q("SELECT id, title FROM instructions ORDER BY id")
     if not rows:
         await message.answer("Инструкций пока нет.")
         return
-    await message.answer("📖 Инструкции для водителей:",
-                         reply_markup=ikb([[(short(r["title"], 60), f"i:{r['id']}")] for r in rows]))
+    unacked = {r["id"] for r in S.instr_unacked(uid)}
+    head = (f"📖 <b>Инструкции</b>\nВсего: <b>{len(rows)}</b> · не ознакомлены: <b>{len(unacked)}</b>"
+            + ("\n\n🆕 — нужно ознакомиться и нажать «✅ Ознакомлен(а)»." if unacked else "\n\n✅ Со всеми ознакомлены."))
+    btns = [[(("🆕 " if r["id"] in unacked else "✅ ") + short(r["title"], 56), f"i:{r['id']}")]
+            for r in sorted(rows, key=lambda r: r["id"] not in unacked)]
+    await message.answer(head, reply_markup=ikb(btns))
 
 
 @router.callback_query(F.data.startswith("i:"))
@@ -729,8 +921,7 @@ async def cb_instruction(cb: CallbackQuery, bot: Bot):
     if not r:
         await cb.message.answer("Инструкция удалена.")
         return
-    await send_content(bot, cb.from_user.id, f"📖 <b>{h(r['title'])}</b>\n\n{r['body'] or ''}",
-                       r["file_id"], r["file_type"])
+    await acks.send_instruction(bot, cb.from_user.id, r, ask_ack=not S.instr_is_acked(r["id"], cb.from_user.id))
 
 
 @router.message()

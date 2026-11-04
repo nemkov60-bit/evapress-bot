@@ -10,6 +10,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, ChatMemberUpdated, FSInputFile, InputMediaPhoto, Message, ReplyKeyboardRemove
 
+import acks
 import backup
 import db
 import notes as N
@@ -54,32 +55,30 @@ class Adm(StatesGroup):
 
 HELP = (
     "<b>Справка администратора</b>\n\n"
-    "📥 <b>Загрузка Excel</b> — отправьте файл .xlsx в чат. Дата берётся из имени файла "
-    "(например «04.11.2026_маршруты.xlsx») или из подписи к файлу. Каждый лист = номер маршрута. "
-    "Повторная загрузка файла на ту же дату обновит адреса и сохранит уже закрытые точки и назначения.\n\n"
-    "🧭 <b>Назначить маршруты</b> — выбор даты → маршрута → водителя.\n"
-    "📊 <b>Статистика</b> — /stats, /stats 04.11.2026, /stats 1 6 14, /stats 04.11.2026 1 6\n"
-    "📑 <b>Отчёт</b> — /report 04.11.2026 14 (дата и номер маршрута) или через кнопку.\n"
-    "📤 <b>Выгрузить Excel</b> — /export или /export 04.11.2026. В столбец «кол-во ТК» ставится 1 (точка закрыта) "
-    "или 0 (не закрыта), формат файла не меняется.\n"
-    "📖 <b>Инструкции</b> — добавить / изменить / удалить инструкции для водителей.\n"
-    "✉️ <b>Сообщение водителям</b> — инструкция всем водителям на маршруте, всем водителям или конкретному.\n"
-    "⚙️ <b>Текст «Проблема»</b> — памятка и контакты, которые видит водитель по кнопке «Проблема на адресе».\n"
-    "🔒 <b>Закрыть рейс</b> — закрывает все маршруты на дату: водители больше не могут закрывать точки, "
-    "бот присылает итоговый Excel.\n"
-    "🗜 <b>Сохранить .ZIP</b> — архив за дату: итоговый Excel и папки маршрутов с фото водителей. "
-    "Если архив больше 45 МБ, он делится на части (ограничение Telegram).\n"
-    "🎟 <b>Пригласить</b> — одноразовая ссылка-приглашение для водителя, заказчика или администратора "
-    "(действует 7 дней). Без приглашения в бот попасть нельзя.\n"
-    "👥 <b>Пользователи</b> — список пользователей, смена роли, удаление.\n"
-    "/cancel — отменить текущее действие."
+    "📥 <b>Загрузка Excel</b> — отправьте файл .xlsx в чат (можно, даже если прошлые рейсы не закрыты). "
+    "Дата — из имени файла или подписи. Рейс получает название по неделе: «02-08 ноябрь 2026».\n"
+    "🗂 <b>Рейсы</b> — переименовать рейс, закрыть/открыть рейс, «🛣 Маршруты и точки»: закрыть маршрут, "
+    "открыть точку, добавить в неё фото за водителя и закрыть её (без фото — с обязательной причиной).\n"
+    "🗜 <b>ZIP-архивы</b> — итоговые архивы рейсов (собираются при закрытии рейса и хранятся в канале резервных "
+    "копий): Excel, папки маршрутов с фото маршрутных листов и папки адресов с фото точек.\n"
+    "🧭 <b>Назначить маршруты</b> — рейс → маршрут → водитель.\n"
+    "📊 <b>Статистика</b> — /stats, /stats 1 6 14 · 📑 <b>Отчёт</b> — /report 04.11.2026 14 или кнопкой.\n"
+    "📤 <b>Выгрузить Excel</b> — /export. В «кол-во ТК» — 1 (точка закрыта) или 0.\n"
+    "📖 <b>Инструкции</b> — добавить/изменить/удалить; новые и изменённые уходят водителям на ознакомление; "
+    "«📊 Отчёт ознакомления».\n"
+    "✉️ <b>Сообщение водителям</b> и 📝 <b>Примечания</b> — водитель подтверждает получение, статус обновляется "
+    "в вашем сообщении.\n"
+    "Запросы водителей «закрыть точку без фото» приходят с кнопками ✅/❌. Маршрут закрывается сам, когда все "
+    "точки закрыты.\n"
+    "🎟 <b>Пригласить</b> · 👥 <b>Пользователи</b> · 💾 <b>Резервная копия</b> · /cancel — отмена действия."
 )
 
 CUSTOMER_HELP = (
     "<b>Справка</b>\n\n"
     "📊 <b>Статистика</b> — /stats, /stats 04.11.2026, /stats 1 6 14\n"
     "📑 <b>Отчёт</b> — /report 04.11.2026 14 или через кнопку. В отчёте по маршруту есть кнопки "
-    "«🖼 Фото по маршруту» и «📝 Примечания к маршруту» (только просмотр)."
+    "«🖼 Фото по маршруту» и «📝 Примечания к маршруту» (только просмотр).\n"
+    "🗜 <b>ZIP-архивы</b> — итоговые архивы закрытых рейсов: Excel, фото маршрутных листов и фото по адресам."
 )
 
 
@@ -209,14 +208,16 @@ async def do_import(message: Message, tmp: Path, name: str, d: date):
         await message.answer(f"❌ Не удалось прочитать файл: {h(str(e))}", reply_markup=ADMIN_KB)
         return
     routes = ", ".join(f"№{h(no)} ({n})" for no, n in res["routes"])
-    text = (f"✅ Файл на <b>{S.fmt_date(res['date'])}</b> загружен"
-            + (" (заменён предыдущий)" if res["replaced"] else "") + ".\n"
+    wb = S.workbook_by_date(d)
+    text = (f"✅ Рейс <b>{h(S.wb_title(wb))}</b> загружен (файл от {S.fmt_date(res['date'])})"
+            + (" — заменён предыдущий файл на эту дату" if res["replaced"] else "") + ".\n"
+            "Название рейса можно изменить: «🗂 Рейсы» → рейс → «✏️ Переименовать».\n"
             f"Маршрутов: <b>{len(res['routes'])}</b>, точек: <b>{res['points']}</b>.\n"
             f"Маршруты (точек): {routes}")
     if res["replaced"]:
         text += f"\nСохранено закрытых точек: {res['kept_closed']}"
-    wb = S.workbook_by_date(d)
-    await message.answer(text, reply_markup=ikb([[("🧭 Назначить маршруты", f"wd:as:{wb['id']}")]]))
+    await message.answer(text, reply_markup=ikb([[("🧭 Назначить маршруты", f"wd:as:{wb['id']}")],
+                                                 [("✏️ Переименовать рейс", f"tn:{wb['id']}")]]))
     await message.answer("Меню:", reply_markup=ADMIN_KB)
 
 
@@ -266,7 +267,7 @@ async def cb_assign_route(cb: CallbackQuery):
     rid = int(cb.data[3:])
     r = S.route_with_wb(rid)
     if r["wb_closed_at"]:
-        await cb.answer("Рейс на эту дату закрыт. Сначала откройте его снова.", show_alert=True)
+        await cb.answer("Рейс закрыт. Сначала откройте его снова.", show_alert=True)
         return
     drv = S.drivers()
     if not drv:
@@ -284,7 +285,7 @@ async def cb_assign_route(cb: CallbackQuery):
     rows.append([("🚫 Снять назначение", f"ad:{rid}:0")])
     rows.append([("⬅️ Назад", f"wd:as:{r['workbook_id']}")])
     await cb.answer()
-    await safe_edit(cb, f"Маршрут №{h(r['route_no'])} ({S.fmt_date(r['work_date'])}).\n"
+    await safe_edit(cb, f"Маршрут №{h(r['route_no'])} ({S.route_title(r)}).\n"
                         f"Сейчас: {h(S.driver_name(r['driver_id']))}\nВыберите водителя:", ikb(rows))
 
 
@@ -300,13 +301,13 @@ async def cb_assign_driver(cb: CallbackQuery, bot: Bot):
         c, t = S.route_counts(rid)
         try:
             await bot.send_message(uid, f"🗺 Вам назначен маршрут <b>№{h(r['route_no'])}</b> на "
-                                        f"<b>{S.fmt_date(r['work_date'])}</b>, точек: {t}.\n"
+                                        f"<b>{S.route_title(r)}</b>, точек: {t}.\n"
                                         f"Нажмите «🚚 Начать маршрут», когда будете готовы.")
         except Exception:
             await cb.message.answer("⚠️ Не удалось уведомить водителя (он не запускал бота?).")
     if prev and prev != uid:
         try:
-            await bot.send_message(prev, f"ℹ️ Маршрут №{h(r['route_no'])} на {S.fmt_date(r['work_date'])} "
+            await bot.send_message(prev, f"ℹ️ Маршрут №{h(r['route_no'])} (рейс {S.route_title(r)}) "
                                          f"с вас снят.")
         except Exception:
             pass
@@ -362,7 +363,7 @@ async def show_report_routes(message: Message, wb):
     rows = [[("📋 Все маршруты", f"rp:{wb['id']}:0")]]
     btns = [(f"№{r['route_no']}", f"rp:{wb['id']}:{r['id']}") for r in S.routes_of(wb["id"])]
     rows += [btns[i:i + 5] for i in range(0, len(btns), 5)]
-    await message.answer(f"📑 Отчёт на {S.fmt_date(wb['work_date'])}. Выберите маршрут:", reply_markup=ikb(rows))
+    await message.answer(f"📑 Отчёт: рейс {S.wb_title(wb)}. Выберите маршрут:", reply_markup=ikb(rows))
 
 
 @router.callback_query(F.data.startswith("rp:"))
@@ -391,7 +392,7 @@ async def cmd_report(message: Message, command: CommandObject, state: FSMContext
     for no in routes:
         r = db.q1("SELECT * FROM routes WHERE workbook_id=? AND lower(route_no)=lower(?)", (wb["id"], no))
         if not r:
-            await message.answer(f"Маршрут №{h(no)} не найден на {S.fmt_date(wb['work_date'])}.")
+            await message.answer(f"Маршрут №{h(no)} не найден в рейсе {S.wb_title(wb)}.")
             continue
         await send_content(message.bot, message.chat.id, S.report_text(wb, r),
                            reply_markup=report_kb(message.from_user.id, r))
@@ -400,6 +401,8 @@ async def cmd_report(message: Message, command: CommandObject, state: FSMContext
 def report_kb(uid: int, r):
     rows = [[("🖼 Фото по маршруту", f"ph:{r['id']}")]]
     rows.append([("📝 Примечания к маршруту", f"ntr:{r['id']}")])  # заказчику — только просмотр
+    if is_admin(uid):
+        rows.append([("🛣 Управление маршрутом и точками", f"rt:{r['id']}")])
     if r["closed_at"] and is_admin(uid):
         rows.append([("↩️ Открыть маршрут снова", f"rro:{r['id']}")])
     elif r["close_req_at"] and is_admin(uid):
@@ -420,14 +423,14 @@ async def cb_route_close_approve(cb: CallbackQuery, bot: Bot):
     except Exception:
         pass
     c, t = S.route_counts(rid)
-    await cb.message.answer(f"✅ Рейс по маршруту №{h(r['route_no'])} ({S.fmt_date(r['work_date'])}) закрыт. "
+    await cb.message.answer(f"✅ Рейс по маршруту №{h(r['route_no'])} ({S.route_title(r)}) закрыт. "
                             f"Закрыто точек: {c} из {t}.")
     driver = r["close_req_by"] or r["driver_id"]
     if driver:
         try:
             await send_poster(bot, driver, "thanks",
                               f"🏁 Логист подтвердил закрытие рейса по маршруту №{h(r['route_no'])} на "
-                              f"{S.fmt_date(r['work_date'])}.\nЗакрыто точек: {c} из {t}.\n\n"
+                              f"{S.route_title(r)}.\nЗакрыто точек: {c} из {t}.\n\n"
                               f"Благодарим за отличную работу!")
         except Exception:
             pass
@@ -459,7 +462,7 @@ async def _reject(message: Message, rid: int, reason: str, bot: Bot, admin_id: i
     if driver:
         try:
             await bot.send_message(driver, f"❌ Логист отклонил закрытие рейса по маршруту №{h(r['route_no'])} "
-                                           f"на {S.fmt_date(r['work_date'])}."
+                                           f"(рейс {S.route_title(r)})."
                                            + (f"\n\n💬 {reason}" if reason else "")
                                            + "\n\nПродолжайте маршрут.",
                                    reply_markup=ikb([[("🗺 Открыть маршрут", f"r:{rid}")]]))
@@ -486,16 +489,16 @@ async def cb_route_reopen(cb: CallbackQuery, bot: Bot):
     rid = int(cb.data[4:])
     r = S.route_with_wb(rid)
     if r["wb_closed_at"]:
-        await cb.answer("Рейс на эту дату закрыт целиком. Сначала откройте его снова.", show_alert=True)
+        await cb.answer("Рейс закрыт целиком. Сначала откройте его снова.", show_alert=True)
         return
     S.reopen_route(rid)
     await cb.answer("Маршрут открыт")
-    await cb.message.answer(f"↩️ Маршрут №{h(r['route_no'])} ({S.fmt_date(r['work_date'])}) снова открыт: "
+    await cb.message.answer(f"↩️ Маршрут №{h(r['route_no'])} ({S.route_title(r)}) снова открыт: "
                             f"водитель может закрывать точки.")
     if r["driver_id"]:
         try:
             await bot.send_message(r["driver_id"], f"↩️ Логист снова открыл маршрут №{h(r['route_no'])} на "
-                                                   f"{S.fmt_date(r['work_date'])}. Нажмите «📋 Мой маршрут».")
+                                                   f"{S.route_title(r)}. Нажмите «📋 Мой маршрут».")
         except Exception:
             pass
 
@@ -567,7 +570,7 @@ async def send_export(message: Message, wb):
         tc, tt = tc + c, tt + t
     kind = "🔒 Итоговый Excel (рейс закрыт)" if wb["closed_at"] else "📤 Промежуточная выгрузка (рейс не закрыт)"
     await message.answer_document(FSInputFile(path, filename=wb["filename"]),
-                                  caption=f"{kind} на {S.fmt_date(wb['work_date'])}, "
+                                  caption=f"{kind}: рейс {S.wb_title(wb)}, "
                                           f"сформирована {db.now():%d.%m.%Y %H:%M}.\n"
                                           f"Закрыто точек: {tc} из {tt}, не закрыто: {tt - tc}.")
 
@@ -577,14 +580,23 @@ async def send_export(message: Message, wb):
 def instr_list_markup():
     rows = [[(short(r["title"], 55), f"iv:{r['id']}")] for r in db.q("SELECT id, title FROM instructions ORDER BY id")]
     rows.append([("➕ Добавить инструкцию", "ia")])
+    rows.append([("📊 Отчёт ознакомления", "irep")])
     return ikb(rows)
 
 
-@router.message(F.text == A_INSTR, ADM)
+@router.message(F.text.in_({A_INSTR, "📖 Инструкции водителям"}), ADM)
 async def instr_menu(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("📖 Инструкции для водителей. Нажмите на инструкцию, чтобы просмотреть, "
-                         "изменить или удалить её.", reply_markup=instr_list_markup())
+    n = db.q1("SELECT COUNT(*) c FROM instructions")["c"]
+    await message.answer(f"📖 <b>Инструкции</b> ({n}). Нажмите на инструкцию, чтобы просмотреть, изменить или удалить её. "
+                         f"Новые и изменённые инструкции автоматически приходят водителям на ознакомление.",
+                         reply_markup=instr_list_markup())
+
+
+@router.callback_query(F.data == "irep", ADM)
+async def cb_instr_report(cb: CallbackQuery):
+    await cb.answer()
+    await send_content(cb.bot, cb.message.chat.id, acks.instr_report())
 
 
 @router.callback_query(F.data == "ia", ADM)
@@ -651,16 +663,18 @@ async def instr_body(message: Message, state: FSMContext):
             await message.answer("Инструкция была удалена.", reply_markup=ADMIN_KB)
             return
         title = old["title"] if title == "-" else title
-        db.x("UPDATE instructions SET title=?, body=?, file_id=?, file_type=?, updated_at=? WHERE id=?",
-             (title, text, file_id, file_type, db.now_s(), iid))
+        db.x("UPDATE instructions SET title=?, body=?, file_id=?, file_type=?, updated_at=?, version_at=? WHERE id=?",
+             (title, text, file_id, file_type, db.now_s(), db.now_s(), iid))
         await message.answer("✅ Инструкция обновлена.", reply_markup=ADMIN_KB)
     else:
         if title == "-":
             title = "Инструкция"
-        db.x("INSERT INTO instructions(title, body, file_id, file_type, created_at, updated_at) VALUES(?,?,?,?,?,?)",
-             (title, text, file_id, file_type, db.now_s(), db.now_s()))
+        iid = db.x("INSERT INTO instructions(title, body, file_id, file_type, created_at, updated_at, version_at) "
+                   "VALUES(?,?,?,?,?,?,?)", (title, text, file_id, file_type, db.now_s(), db.now_s(), db.now_s()))
         await message.answer("✅ Инструкция добавлена.", reply_markup=ADMIN_KB)
-    await message.answer("📖 Инструкции:", reply_markup=instr_list_markup())
+    sent, total = await acks.broadcast_instruction(message.bot, iid, edited=bool(data.get("instr_id")))
+    await message.answer(f"📨 Отправлено водителям на ознакомление: {sent} из {total}. "
+                         f"Следить за ознакомлением — «📊 Отчёт ознакомления».", reply_markup=instr_list_markup())
 
 
 @router.callback_query(F.data.startswith("idl:"), ADM)
@@ -732,21 +746,27 @@ async def cb_msg_target(cb: CallbackQuery, state: FSMContext):
 async def msg_send(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     await state.clear()
+    mid = S.msg_register(message.from_user.id, "message", data["label"],
+                         message.text or message.caption or "(медиа)", message.chat.id)
     ok = 0
     for uid in data["targets"]:
         try:
             if message.text:
-                await bot.send_message(uid, f"📨 <b>Сообщение от логиста</b>\n\n{message.html_text}")
+                await bot.send_message(uid, f"📨 <b>Сообщение от логиста</b>\n\n{message.html_text}\n\n"
+                                            f"<i>Подтвердите получение кнопкой ниже.</i>",
+                                       reply_markup=acks.ack_markup(mid))
             else:
-                await bot.send_message(uid, "📨 <b>Сообщение от логиста</b>")
-                await bot.copy_message(uid, message.chat.id, message.message_id)
+                await bot.send_message(uid, "📨 <b>Сообщение от логиста</b> — подтвердите получение кнопкой под ним.")
+                await bot.copy_message(uid, message.chat.id, message.message_id, reply_markup=acks.ack_markup(mid))
+            S.msg_delivered(mid, uid)
             ok += 1
         except Exception:
             pass
         await asyncio.sleep(0.05)
-    db.x("INSERT INTO admin_messages(admin_id, target, text, created_at) VALUES(?,?,?,?)",
-         (message.from_user.id, data["label"], message.text or message.caption or "(медиа)", db.now_s()))
-    await message.answer(f"✅ Доставлено: {ok} из {len(data['targets'])}.", reply_markup=ADMIN_KB)
+    await message.answer(f"✅ Доставлено: {ok} из {len(data['targets'])}. Подтверждения получения — ниже, "
+                         f"сообщение обновляется само.", reply_markup=ADMIN_KB)
+    if ok:
+        await acks.post_summary(bot, mid)
 
 
 # ------------------------------------------------------------ users -------
@@ -924,7 +944,7 @@ async def close_menu(message: Message, state: FSMContext):
         await message.answer("Нет открытых рейсов. Все загруженные даты уже закрыты.")
         return
     await message.answer("🔒 Какой рейс закрыть?",
-                         reply_markup=ikb([[(f"🔒 Закрыть рейс {S.fmt_date(w['work_date'])}", f"cl:{w['id']}")]
+                         reply_markup=ikb([[(f"🔒 Закрыть рейс {S.wb_title(w)}", f"cl:{w['id']}")]
                                            for w in wbs]))
 
 
@@ -933,14 +953,14 @@ async def cb_close_ask(cb: CallbackQuery):
     wb = db.q1("SELECT * FROM workbooks WHERE id=?", (int(cb.data[3:]),))
     await cb.answer()
     if wb["closed_at"]:
-        await cb.message.answer(f"Рейс {S.fmt_date(wb['work_date'])} уже закрыт.")
+        await cb.message.answer(f"Рейс {S.wb_title(wb)} уже закрыт.")
         return
     c, t = S.wb_totals(wb["id"])
     await cb.message.answer(
-        f"Закрыть рейс <b>{S.fmt_date(wb['work_date'])}</b>?\n\n"
+        f"Закрыть рейс <b>{S.wb_title(wb)}</b>?\n\n"
         f"✅ Закрыто точек: <b>{c}</b>\n❌ Не закрыто: <b>{t - c}</b> (в Excel будет 0)\n\n"
         f"После закрытия водители не смогут закрывать точки на эту дату. Рейс можно будет открыть снова.",
-        reply_markup=ikb([[(f"✅ Закрыть рейс {S.fmt_date(wb['work_date'])}", f"clc:{wb['id']}")],
+        reply_markup=ikb([[(f"✅ Закрыть рейс {S.wb_title(wb)}", f"clc:{wb['id']}")],
                           [("Отмена", "noop")]]))
 
 
@@ -953,13 +973,15 @@ async def do_close(message: Message, wb_id: int, admin_id: int, bot: Bot) -> Non
                   "AND closed_at IS NULL", (wb_id,)):
         try:
             await send_poster(bot, r["driver_id"], "thanks",
-                              f"🔒 Рейс на {S.fmt_date(wb['work_date'])} закрыт администратором.\n\n"
+                              f"🔒 Рейс «{S.wb_title(wb)}» закрыт администратором.\n\n"
                               f"Благодарим за отличную работу!")
         except Exception:
             pass
     db.x("UPDATE routes SET close_req_at=NULL, close_req_by=NULL WHERE workbook_id=?", (wb_id,))
     await send_content(bot, message.chat.id, S.report_all_text(wb))
     await send_export(message, wb)
+    # итоговый ZIP собирается в фоне и сохраняется в архив — его смогут скачать администраторы и заказчики
+    asyncio.create_task(zip_send(message, wb_id, deliver=False))
 
 
 @router.callback_query(F.data.startswith("clc:"), ADM)
@@ -971,7 +993,8 @@ async def cb_close_confirm(cb: CallbackQuery, bot: Bot):
     except Exception:
         pass
     await do_close(cb.message, wb_id, cb.from_user.id, bot)
-    await cb.message.answer("Что дальше?", reply_markup=ikb([[("🗜 Сохранить .ZIP", f"zp:{wb_id}")],
+    await cb.message.answer("Итоговый ZIP собирается и сохранится в «🗜 ZIP-архивы». Что дальше?",
+                            reply_markup=ikb([[("🗜 Скачать ZIP сейчас", f"zp:{wb_id}")],
                                                              [("↩️ Открыть рейс снова", f"ro:{wb_id}")]]))
 
 
@@ -981,7 +1004,7 @@ async def cb_reopen(cb: CallbackQuery):
     S.reopen_workbook(wb_id)
     wb = db.q1("SELECT * FROM workbooks WHERE id=?", (wb_id,))
     await cb.answer("Рейс открыт")
-    await safe_edit(cb, f"↩️ Рейс {S.fmt_date(wb['work_date'])} снова открыт: водители могут закрывать точки.")
+    await safe_edit(cb, f"↩️ Рейс {S.wb_title(wb)} снова открыт: водители могут закрывать точки.")
 
 
 # ------------------------------------------------------------ zip ---------
@@ -996,7 +1019,7 @@ async def zip_ask(message: Message, wb):
     if wb["closed_at"]:
         await zip_send(message, wb["id"])
         return
-    d = S.fmt_date(wb["work_date"])
+    d = S.wb_title(wb)
     await message.answer(f"Рейс {d} ещё не закрыт. Закрыть его и сохранить ZIP?",
                          reply_markup=ikb([[(f"🔒 Закрыть рейс {d} и сохранить ZIP", f"clz:{wb['id']}")],
                                            [("🗜 Сохранить без закрытия", f"zp:{wb['id']}")],
@@ -1021,7 +1044,8 @@ async def cb_zip(cb: CallbackQuery):
     await zip_send(cb.message, int(cb.data[3:]))
 
 
-async def zip_send(message: Message, wb_id: int):
+async def zip_send(message: Message, wb_id: int, deliver: bool = True):
+    """Собирает ZIP, сохраняет его в архив (канал резервных копий) и, если deliver, присылает в чат."""
     if zipper.is_busy():
         await message.answer("⏳ Уже собирается другой архив, попробуйте через пару минут.")
         return
@@ -1044,18 +1068,36 @@ async def zip_send(message: Message, wb_id: int):
         await message.answer(f"❌ Не удалось собрать архив: {h(str(e))}")
         return
     try:
+        stamp = db.now_s()
+        channel = backup.channel_id()
         for i, p in enumerate(parts, 1):
-            cap = (f"🗜 {S.fmt_date(wb['work_date'])}"
+            cap = (f"🗜 {S.wb_title(wb)}"
                    + ("" if len(parts) == 1 else f" — часть {i} из {len(parts)}")
                    + (f"\nИтоговый Excel и папки маршрутов, фото: {n_photos}" if i == 1 else ""))
-            await message.bot.send_document(message.chat.id, FSInputFile(p, filename=p.name), caption=cap,
-                                            request_timeout=600)
+            sent = None
+            if channel:  # архив хранится в закрытом канале, оттуда его выдаём по запросу
+                try:
+                    sent = await message.bot.send_document(channel, FSInputFile(p, filename=p.name), caption=cap,
+                                                           request_timeout=600, disable_notification=True)
+                except Exception as e:  # noqa: BLE001
+                    await message.answer(f"⚠️ Не удалось сохранить архив в канал: {h(str(e)[:200])}")
+            if sent is None or deliver:
+                if sent is not None:
+                    await message.bot.send_document(message.chat.id, sent.document.file_id, caption=cap)
+                else:
+                    sent = await message.bot.send_document(message.chat.id, FSInputFile(p, filename=p.name),
+                                                           caption=cap, request_timeout=600)
+            if sent is not None and getattr(sent, "document", None):
+                db.x("INSERT INTO zip_archives(workbook_id, part_no, parts, file_name, file_id, chat_id, message_id, "
+                     "created_at) VALUES(?,?,?,?,?,?,?,?)", (wb_id, i, len(parts), p.name, sent.document.file_id,
+                                                             sent.chat.id, sent.message_id, stamp))
         if failed:
             await message.answer(f"⚠️ Не удалось скачать {len(failed)} фото — список в файле "
                                  f"«не_удалось_скачать.txt» внутри архива.")
         try:
             await status.edit_text(f"✅ Архив {zipper.zip_base_name(wb)} готов"
-                                   + (f" ({len(parts)} части)" if len(parts) > 1 else "") + ".")
+                                   + (f" ({len(parts)} части)" if len(parts) > 1 else "")
+                                   + " и сохранён в «🗜 ZIP-архивы»" + (" (канал)" if backup.channel_id() else "") + ".")
         except Exception:
             pass
     except Exception as e:  # noqa: BLE001
@@ -1111,7 +1153,7 @@ async def cb_route_notes(cb: CallbackQuery):
     admin = is_admin(cb.from_user.id)
     r = S.route_with_wb(rid)
     await cb.answer()
-    lines = [f"📝 <b>Примечания: маршрут №{h(r['route_no'])}, {S.fmt_date(r['work_date'])}</b>", ""]
+    lines = [f"📝 <b>Примечания: маршрут №{h(r['route_no'])}, {S.route_title(r)}</b>", ""]
     rows = []
     rn = N.for_route(r["route_no"], r["work_date"])
     if rn:
@@ -1164,7 +1206,7 @@ async def cb_note_target(cb: CallbackQuery, state: FSMContext):
         await state.update_data(n_scope="point", n_key=N.point_key(p), n_route=r["route_no"], n_date=r["work_date"],
                                 n_rid=r["id"], n_pid=oid)
     await cb.answer()
-    d = S.fmt_date(r["work_date"])
+    d = S.route_title(r)
     await cb.message.answer(f"❗ Примечание: {target}.\nКак долго оно действует?",
                             reply_markup=ikb([[(f"📅 Только на {d}", "nw:d")],
                                               [("♾ Постоянно (для всех будущих дат)", "nw:p")]]))
@@ -1196,10 +1238,14 @@ async def note_text_save(message: Message, state: FSMContext, bot: Bot):
         if d["n_pid"]:
             p = db.q1("SELECT address FROM points WHERE id=?", (d["n_pid"],))
             where = f"адресу {h(p['address'])} (маршрут №{h(r['route_no'])})"
+        mid = S.msg_register(message.from_user.id, "note", f"{S.driver_name(r['driver_id'])}, {where}",
+                             message.text or "", message.chat.id)
         try:
             await bot.send_message(r["driver_id"], f"❗ <b>Логист добавил важное примечание к {where}:</b>\n\n"
-                                                   f"{message.html_text}",
-                                   reply_markup=ikb([[("🗺 Открыть маршрут", f"r:{r['id']}")]]))
+                                                   f"{message.html_text}\n\n<i>Подтвердите получение кнопкой ниже.</i>",
+                                   reply_markup=acks.ack_markup(mid, [[("🗺 Открыть маршрут", f"r:{r['id']}")]]))
+            S.msg_delivered(mid, r["driver_id"])
+            await acks.post_summary(bot, mid)
         except Exception:
             pass
 

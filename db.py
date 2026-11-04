@@ -141,6 +141,34 @@ def migrate() -> None:
     CREATE INDEX IF NOT EXISTS ix_photos_point ON photos(point_id);
     CREATE INDEX IF NOT EXISTS ix_photos_problem ON photos(problem_id);
     """)
+    # v9: названия рейсов, закрытие точки без фото (запрос/причина), ознакомление с инструкциями,
+    # подтверждение сообщений, архив ZIP в канале
+    _add_col("workbooks", "title", "title TEXT")
+    _add_col("points", "close_req_at", "close_req_at TEXT")
+    _add_col("points", "close_req_by", "close_req_by INTEGER")
+    _add_col("points", "close_req_comment", "close_req_comment TEXT")
+    _add_col("points", "close_note", "close_note TEXT")          # причина закрытия без фото
+    _add_col("points", "closed_via", "closed_via TEXT")          # driver / admin / approved
+    _add_col("instructions", "version_at", "version_at TEXT")
+    _add_col("admin_messages", "kind", "kind TEXT")              # message / note
+    _add_col("admin_messages", "admin_chat_id", "admin_chat_id INTEGER")
+    _add_col("admin_messages", "summary_msg_id", "summary_msg_id INTEGER")
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS instr_acks(
+        instruction_id INTEGER, user_id INTEGER, acked_at TEXT,
+        PRIMARY KEY(instruction_id, user_id)
+    );
+    CREATE TABLE IF NOT EXISTS msg_deliveries(
+        message_id INTEGER, user_id INTEGER, delivered_at TEXT, acked_at TEXT,
+        PRIMARY KEY(message_id, user_id)
+    );
+    CREATE TABLE IF NOT EXISTS zip_archives(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        workbook_id INTEGER, part_no INTEGER, parts INTEGER, file_name TEXT,
+        file_id TEXT, chat_id INTEGER, message_id INTEGER, created_at TEXT
+    );
+    """)
+    conn.execute("UPDATE instructions SET version_at=COALESCE(updated_at, created_at) WHERE version_at IS NULL")
     # перенос единственного фото из старых записей problems в photos
     conn.execute("""INSERT INTO photos(kind, point_id, route_id, problem_id, driver_id, file_id, file_type, created_at)
                     SELECT 'problem', point_id, route_id, id, driver_id, file_id, file_type, created_at

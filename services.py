@@ -10,7 +10,7 @@ from pathlib import Path
 
 import db
 import excel
-from config import ADMIN_IDS, EXPORT_DIR, WRITE_PROBLEMS_TO_COMMENTS, DRIVER_ROUTE_DAYS
+from config import ADMIN_IDS, EXPORT_DIR, WRITE_PROBLEMS_TO_COMMENTS
 
 DEFAULT_PROBLEM_HELP = (
     "⚠️ <b>Нестандартная ситуация на адресе</b>\n\n"
@@ -41,6 +41,27 @@ def parse_date(text: str | None) -> date | None:
         return date(y, mth, d)
     except ValueError:
         return None
+
+
+MONTHS = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь",
+          "ноябрь", "декабрь"]
+
+
+def default_title(iso: str) -> str:
+    """Название рейса по неделе (пн–вс), в которую попадает дата: «02-08 ноябрь 2026», «30-06 декабрь 2026»."""
+    d = datetime.strptime(iso, "%Y-%m-%d").date()
+    mon = d - timedelta(days=d.weekday())
+    sun = mon + timedelta(days=6)
+    return f"{mon.day:02d}-{sun.day:02d} {MONTHS[sun.month - 1]} {sun.year}"
+
+
+def wb_title(wb) -> str:
+    return (wb["title"] or "").strip() or default_title(wb["work_date"])
+
+
+def route_title(r) -> str:
+    """Название рейса для строки маршрута из route_with_wb / driver_routes."""
+    return (r["wb_title"] or "").strip() or default_title(r["work_date"])
 
 
 def fmt_date(iso: str) -> str:
@@ -144,7 +165,7 @@ def wb_totals(wb_id: int) -> tuple[int, int]:
 
 
 def date_label(wb) -> str:
-    return fmt_date(wb["work_date"]) + (" 🔒" if wb["closed_at"] else "")
+    return wb_title(wb) + (" 🔒" if wb["closed_at"] else "")
 
 
 # ------------------------------------------------------------- import ------
@@ -159,9 +180,11 @@ def import_workbook(path: Path, filename: str, work_date: date, admin_id: int) -
     old_assign: dict[str, tuple] = {}
     old_points: dict[tuple, list] = defaultdict(list)
     old_route_sheet: dict[int, str] = {}
+    old_route_state: dict[str, dict] = {}
     if old_wb:
         for r in db.q("SELECT * FROM routes WHERE workbook_id=?", (old_wb["id"],)):
             old_route_sheet[r["id"]] = r["sheet_name"]
+            old_route_state[r["sheet_name"]] = dict(r)
             old_assign[r["sheet_name"]] = (r["driver_id"], r["assigned_at"], r["started_at"], r["finished_at"])
             for p in db.q("SELECT * FROM points WHERE route_id=? ORDER BY seq", (r["id"],)):
                 key = (r["sheet_name"], p["code_1c"], p["address"], p["point_no"])
@@ -171,8 +194,8 @@ def import_workbook(path: Path, filename: str, work_date: date, admin_id: int) -
         wb_id = old_wb["id"]
         db.x("DELETE FROM routes WHERE workbook_id=?", (wb_id,))
     else:
-        wb_id = db.x("INSERT INTO workbooks(work_date, filename, path, uploaded_at, uploaded_by) VALUES(?,?,?,?,?)",
-                     (iso, filename, str(path), db.now_s(), admin_id))
+        wb_id = db.x("INSERT INTO workbooks(work_date, filename, path, uploaded_at, uploaded_by, title) "
+                     "VALUES(?,?,?,?,?,?)", (iso, filename, str(path), db.now_s(), admin_id, default_title(iso)))
 
     id_map: dict[int, tuple[int, int]] = {}
     new_route_by_sheet: dict[str, int] = {}
@@ -183,6 +206,10 @@ def import_workbook(path: Path, filename: str, work_date: date, admin_id: int) -
                    " assigned_at, started_at, finished_at) VALUES(?,?,?,?,?,?,?,?,?)",
                    (wb_id, r.route_no, r.sheet, r.tk_col, r.comment_col, drv, ass_at, st_at, fin_at))
         new_route_by_sheet[r.sheet] = rid
+        st = old_route_state.get(r.sheet)
+        if st:
+            db.x("UPDATE routes SET closed_at=?, closed_by=?, close_req_at=?, close_req_by=? WHERE id=?",
+                 (st["closed_at"], st["closed_by"], st["close_req_at"], st["close_req_by"], rid))
         for seq, p in enumerate(r.points, 1):
             key = (r.sheet, p.code_1c, p.address, p.point_no)
             old = old_points[key].pop(0) if old_points.get(key) else None
@@ -193,6 +220,9 @@ def import_workbook(path: Path, filename: str, work_date: date, admin_id: int) -
                            " photo_poa, poa_absent) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                            vals + (old["status"], old["opened_at"], old["closed_at"], old["closed_by"],
                                    old["photo_display"], old["photo_invoice"], old["photo_poa"], old["poa_absent"]))
+                db.x("UPDATE points SET close_req_at=?, close_req_by=?, close_req_comment=?, close_note=?, "
+                     "closed_via=? WHERE id=?", (old["close_req_at"], old["close_req_by"], old["close_req_comment"],
+                                                 old["close_note"], old["closed_via"], pid))
                 id_map[old["id"]] = (pid, rid)
                 kept_closed += old["status"] == "closed"
             else:
@@ -280,10 +310,8 @@ def workbook_by_date(d: date):
 
 
 def latest_workbook():
-    """Сегодняшний файл, а если его нет — самый свежий."""
-    today = db.now().date().isoformat()
-    return db.q1("SELECT * FROM workbooks WHERE work_date=?", (today,)) or \
-        db.q1("SELECT * FROM workbooks ORDER BY work_date DESC LIMIT 1")
+    """Последний загруженный рейс (по дате файла)."""
+    return db.q1("SELECT * FROM workbooks ORDER BY work_date DESC, id DESC LIMIT 1")
 
 
 def routes_of(wb_id: int) -> list:
@@ -302,18 +330,17 @@ def route_counts(route_id: int) -> tuple[int, int]:
 
 
 def route_with_wb(route_id: int):
-    return db.q1("SELECT r.*, w.work_date, w.closed_at AS wb_closed_at FROM routes r "
+    return db.q1("SELECT r.*, w.work_date, w.closed_at AS wb_closed_at, w.title AS wb_title FROM routes r "
                  "JOIN workbooks w ON w.id=r.workbook_id WHERE r.id=?",
                  (route_id,))
 
 
 def driver_routes(uid: int) -> list:
-    """Маршруты водителя: сегодняшние + незавершённые за последние N дней."""
-    since = (db.now().date() - timedelta(days=DRIVER_ROUTE_DAYS)).isoformat()
-    rows = db.q("SELECT r.*, w.work_date FROM routes r JOIN workbooks w ON w.id=r.workbook_id "
-                "WHERE r.driver_id=? AND w.work_date>=? AND w.closed_at IS NULL AND r.closed_at IS NULL "
-                "ORDER BY w.work_date DESC", (uid, since))
-    return list(rows)  # пока водитель или админ не закрыл рейс, маршрут остаётся у водителя
+    """Все незакрытые маршруты водителя во всех открытых рейсах (доставка может длиться несколько дней)."""
+    rows = db.q("SELECT r.*, w.work_date, w.title AS wb_title FROM routes r JOIN workbooks w ON w.id=r.workbook_id "
+                "WHERE r.driver_id=? AND w.closed_at IS NULL AND r.closed_at IS NULL "
+                "ORDER BY w.work_date, r.id", (uid,))
+    return list(rows)
 
 
 def route_drivers(route) -> list[str]:
@@ -329,9 +356,9 @@ def route_drivers(route) -> list[str]:
 def route_state(route) -> str:
     c, t = route_counts(route["id"])
     if route["closed_at"]:
-        return f"🏁 рейс закрыт в {fmt_time(route['closed_at'])}"
+        return f"🏁 маршрут закрыт {route['closed_at'][8:10]}.{route['closed_at'][5:7]} в {fmt_time(route['closed_at'])}"
     if route["close_req_at"]:
-        return f"⏳ водитель просит закрыть рейс (с {fmt_time(route['close_req_at'])})"
+        return f"⏳ водитель просит закрыть маршрут (с {fmt_time(route['close_req_at'])})"
     if t and c == t:
         return "✅ выполнен"
     if route["started_at"] or c:
@@ -347,8 +374,8 @@ def stats_text(wb, route_nos: list[str] | None = None) -> str:
         wanted = {n.strip().lower() for n in route_nos}
         routes = [r for r in routes if r["route_no"].lower() in wanted]
         if not routes:
-            return f"Маршруты {', '.join(route_nos)} не найдены в файле на {fmt_date(wb['work_date'])}."
-    lines = [f"📊 <b>Статистика на {fmt_date(wb['work_date'])}</b>"
+            return f"Маршруты {', '.join(route_nos)} не найдены в рейсе «{h(wb_title(wb))}»."
+    lines = [f"📊 <b>Статистика: рейс {h(wb_title(wb))}</b>"
              + (" · рейс закрыт 🔒" if wb["closed_at"] else ""), ""]
     tc = tt = 0
     for r in routes:
@@ -367,7 +394,7 @@ def report_text(wb, route) -> str:
     c, t = route_counts(route["id"])
     names = route_drivers(route)
     lines = [
-        f"📑 <b>Отчёт: {fmt_date(wb['work_date'])}, маршрут №{h(route['route_no'])}</b>",
+        f"📑 <b>Отчёт: рейс {h(wb_title(wb))}, маршрут №{h(route['route_no'])}</b>",
         f"👤 Водитель(и): {h(', '.join(names)) if names else 'не назначен'}",
         f"Статус: {route_state(route)}",
     ]
@@ -395,7 +422,7 @@ def report_text(wb, route) -> str:
 
 def report_all_text(wb) -> str:
     routes = routes_of(wb["id"])
-    lines = [f"📑 <b>Отчёт на {fmt_date(wb['work_date'])} по всем маршрутам</b>"
+    lines = [f"📑 <b>Отчёт: рейс {h(wb_title(wb))}, все маршруты</b>"
              + (" · рейс закрыт 🔒" if wb["closed_at"] else ""), ""]
     tc = tt = 0
     for r in routes:
@@ -414,7 +441,7 @@ def point_text(p, route=None) -> str:
     status = "✅ Закрыта" + (f" в {fmt_time(p['closed_at'])}" if p["closed_at"] else "") \
         if p["status"] == "closed" else "⬜ Не закрыта"
     lines = [
-        f"📍 <b>Точка {p['seq']} — маршрут №{h(route['route_no'])} ({fmt_date(route['work_date'])})</b>",
+        f"📍 <b>Точка {p['seq']} — маршрут №{h(route['route_no'])} ({h(route_title(route))})</b>",
         "",
         f"🏠 <b>Адрес:</b> {h(p['address'])}",
         f"🏪 <b>Сеть:</b> {h(p['network'] or '—')}",
@@ -449,3 +476,114 @@ def next_step(p) -> str | None:
     if not p["photo_poa"] and not p["poa_absent"]:
         return "poa"
     return None
+
+
+# ------------------------------------------------------------- v9: точки ----
+
+def photos_complete(p) -> bool:
+    """Все обязательные фото: выкладка, накладная, доверенность (или отметка «отсутствует»)."""
+    return next_step(p) is None
+
+
+def close_point(pid: int, by: int, via: str, note: str | None = None) -> bool:
+    return db.xc("UPDATE points SET status='closed', closed_at=?, closed_by=?, closed_via=?, close_note=?, "
+                 "close_req_at=NULL WHERE id=? AND status!='closed'", (db.now_s(), by, via, note, pid)) == 1
+
+
+def reopen_point(pid: int) -> None:
+    db.x("UPDATE points SET status='open', closed_at=NULL, closed_by=NULL, closed_via=NULL, close_note=NULL, "
+         "close_req_at=NULL, close_req_by=NULL, close_req_comment=NULL WHERE id=?", (pid,))
+
+
+def request_point_close(pid: int, uid: int, comment: str) -> bool:
+    return db.xc("UPDATE points SET close_req_at=?, close_req_by=?, close_req_comment=? "
+                 "WHERE id=? AND status!='closed' AND close_req_at IS NULL", (db.now_s(), uid, comment, pid)) == 1
+
+
+def auto_close_route(rid: int) -> bool:
+    """Закрывает маршрут, если все точки закрыты. True — закрыли сейчас."""
+    c, t = route_counts(rid)
+    if not t or c < t:
+        return False
+    return db.xc("UPDATE routes SET closed_at=?, closed_by=0, close_req_at=NULL, finished_at=COALESCE(finished_at, ?) "
+                 "WHERE id=? AND closed_at IS NULL", (db.now_s(), db.now_s(), rid)) == 1
+
+
+def admin_close_route(rid: int, admin_id: int) -> bool:
+    return db.xc("UPDATE routes SET closed_at=?, closed_by=?, close_req_at=NULL WHERE id=? AND closed_at IS NULL",
+                 (db.now_s(), admin_id, rid)) == 1
+
+
+def sheet_photos(rid: int) -> list:
+    return db.q("SELECT * FROM photos WHERE kind='sheet' AND route_id=? ORDER BY id", (rid,))
+
+
+def needs_sheet(rid: int) -> bool:
+    """Нужно ли фото маршрутного листа. Маршруты, начатые до этой версии (есть закрытые точки), не требуют."""
+    if sheet_photos(rid):
+        return False
+    c, _ = route_counts(rid)
+    return c == 0
+
+
+# ------------------------------------------------------------- v9: инструкции
+
+def instr_unacked(uid: int) -> list:
+    return db.q("SELECT i.* FROM instructions i LEFT JOIN instr_acks a ON a.instruction_id=i.id AND a.user_id=? "
+                "WHERE a.acked_at IS NULL OR a.acked_at < i.version_at ORDER BY i.id", (uid,))
+
+
+def instr_ack(iid: int, uid: int) -> None:
+    db.x("INSERT INTO instr_acks(instruction_id, user_id, acked_at) VALUES(?,?,?) "
+         "ON CONFLICT(instruction_id, user_id) DO UPDATE SET acked_at=excluded.acked_at", (iid, uid, db.now_s()))
+
+
+def instr_is_acked(iid: int, uid: int) -> bool:
+    return bool(db.q1("SELECT 1 FROM instr_acks a JOIN instructions i ON i.id=a.instruction_id "
+                      "WHERE a.instruction_id=? AND a.user_id=? AND a.acked_at >= i.version_at", (iid, uid)))
+
+
+# ------------------------------------------------------------- v9: сообщения
+
+def msg_register(admin_id: int, kind: str, target: str, text: str, chat_id: int) -> int:
+    return db.x("INSERT INTO admin_messages(admin_id, target, text, created_at, kind, admin_chat_id) "
+                "VALUES(?,?,?,?,?,?)", (admin_id, target, text, db.now_s(), kind, chat_id))
+
+
+def msg_delivered(mid: int, uid: int) -> None:
+    db.x("INSERT OR IGNORE INTO msg_deliveries(message_id, user_id, delivered_at) VALUES(?,?,?)",
+         (mid, uid, db.now_s()))
+
+
+def msg_ack(mid: int, uid: int) -> bool:
+    return db.xc("UPDATE msg_deliveries SET acked_at=? WHERE message_id=? AND user_id=? AND acked_at IS NULL",
+                 (db.now_s(), mid, uid)) == 1
+
+
+def msg_status_text(mid: int) -> str:
+    m = db.q1("SELECT * FROM admin_messages WHERE id=?", (mid,))
+    rows = db.q("SELECT * FROM msg_deliveries WHERE message_id=? ORDER BY acked_at IS NULL, acked_at", (mid,))
+    ok = [r for r in rows if r["acked_at"]]
+    wait = [r for r in rows if not r["acked_at"]]
+    kind = "Примечание" if m["kind"] == "note" else "Сообщение"
+    text = (m["text"] or "")[:150]
+    lines = [f"📨 <b>{kind}</b> ({h(m['target'] or '')}): «{h(text)}»",
+             f"Подтвердили получение: <b>{len(ok)} из {len(rows)}</b>"]
+    lines += [f"✅ {h(driver_name(r['user_id']))} — {fmt_time(r['acked_at'])}" for r in ok]
+    lines += [f"⏳ {h(driver_name(r['user_id']))}" for r in wait]
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------- v9: архив ZIP
+
+def zip_archive(wb_id: int) -> list:
+    """Части последнего сохранённого ZIP рейса."""
+    last = db.q1("SELECT MAX(created_at) m FROM zip_archives WHERE workbook_id=?", (wb_id,))["m"]
+    if not last:
+        return []
+    return db.q("SELECT * FROM zip_archives WHERE workbook_id=? AND created_at=? ORDER BY part_no", (wb_id, last))
+
+
+def archived_workbooks() -> list:
+    return db.q("SELECT w.*, MAX(z.created_at) zip_at FROM workbooks w JOIN zip_archives z ON z.workbook_id=w.id "
+                "GROUP BY w.id ORDER BY w.work_date DESC")

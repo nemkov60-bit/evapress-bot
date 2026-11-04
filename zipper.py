@@ -56,21 +56,30 @@ async def build_zip(bot: Bot, wb_id: int,
         routes = S.routes_of(wb_id)
 
         jobs: list[tuple[str, str, str]] = []   # (папка маршрута, имя в архиве, file_id)
+        texts: dict[str, str] = {}               # текстовые файлы в архиве (причины закрытия без фото)
+        point_dirs: list[str] = []
         for r in routes:
             folder = safe(r["route_no"])
-            for p in db.q("SELECT * FROM points WHERE route_id=? ORDER BY seq", (r["id"],)):
-                base = f"{folder}/{p['seq']:02d}_{safe(p['address'])}"
-                for i, (field, label) in enumerate(KINDS, 1):
-                    if p[field]:
-                        jobs.append((folder, f"{base}_{i}_{label}.jpg", p[field]))
-                for n, x in enumerate(S.extra_photos(p["id"]), 1):
-                    jobs.append((folder, f"{base}_4_доп_{n}{ext(x)}", x["file_id"]))
-                for n, x in enumerate(db.q("SELECT * FROM photos WHERE kind='problem' AND point_id=? ORDER BY id",
-                                           (p["id"],)), 1):
-                    jobs.append((folder, f"{base}_проблема_{n}{ext(x)}", x["file_id"]))
+            # фото маршрутного листа — в папке маршрута
+            for n, x in enumerate(S.sheet_photos(r["id"]), 1):
+                jobs.append((folder, f"{folder}/маршрутный_лист_{n}{ext(x)}", x["file_id"]))
             for n, x in enumerate(db.q("SELECT * FROM photos WHERE kind='problem' AND route_id=? "
                                        "AND point_id IS NULL ORDER BY id", (r["id"],)), 1):
                 jobs.append((folder, f"{folder}/проблема_без_адреса_{n}{ext(x)}", x["file_id"]))
+            # папка на каждый адрес — фото, загруженные при закрытии точки
+            for p in db.q("SELECT * FROM points WHERE route_id=? ORDER BY seq", (r["id"],)):
+                pdir = f"{folder}/{p['seq']:02d}_{safe(p['address'], 50)}"
+                point_dirs.append(pdir + "/")
+                for i, (field, label) in enumerate(KINDS, 1):
+                    if p[field]:
+                        jobs.append((folder, f"{pdir}/{i}_{label}.jpg", p[field]))
+                for n, x in enumerate(S.extra_photos(p["id"]), 1):
+                    jobs.append((folder, f"{pdir}/4_доп_{n}{ext(x)}", x["file_id"]))
+                for n, x in enumerate(db.q("SELECT * FROM photos WHERE kind='problem' AND point_id=? ORDER BY id",
+                                           (p["id"],)), 1):
+                    jobs.append((folder, f"{pdir}/проблема_{n}{ext(x)}", x["file_id"]))
+                if p["close_note"]:
+                    texts[f"{pdir}/причина_закрытия_без_фото.txt"] = p["close_note"]
 
         failed: list[str] = []
         done = 0
@@ -114,8 +123,12 @@ async def build_zip(bot: Bot, wb_id: int,
         new_part()
         zf.write(excel_path, wb["filename"], compress_type=zipfile.ZIP_DEFLATED)
         size += excel_path.stat().st_size
-        for r in routes:  # папка для каждого маршрута, даже если фото нет
+        for r in routes:  # папка для каждого маршрута и адреса, даже если фото нет
             zf.writestr(zipfile.ZipInfo(f"{safe(r['route_no'])}/"), "")
+        for d in point_dirs:
+            zf.writestr(zipfile.ZipInfo(d), "")
+        for name, txt in texts.items():
+            zf.writestr(name, txt, compress_type=zipfile.ZIP_DEFLATED)
         if failed:
             zf.writestr("не_удалось_скачать.txt", "\n".join(failed), compress_type=zipfile.ZIP_DEFLATED)
         for idx, (_, arc, _fid) in enumerate(jobs):

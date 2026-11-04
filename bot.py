@@ -8,6 +8,7 @@ from aiogram.types import BotCommand
 
 import backup
 import handlers_admin
+import handlers_trips
 import handlers_driver
 from config import ADMIN_IDS, BOT_TOKEN, DATA_DIR
 
@@ -21,7 +22,8 @@ async def main():
     logging.info("Данные бота хранятся в %s", DATA_DIR)
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(handlers_admin.router)   # админ — первым
+    dp.include_router(handlers_trips.router)   # рейсы/точки/ZIP — до общего роутера админа с его «заглушками»
+    dp.include_router(handlers_admin.router)
     dp.include_router(handlers_driver.router)
     await bot.set_my_commands([
         BotCommand(command="start", description="Главное меню"),
