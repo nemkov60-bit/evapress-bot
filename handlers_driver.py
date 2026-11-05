@@ -927,10 +927,27 @@ async def instructions(message: Message, state: FSMContext):
     await message.answer(head, reply_markup=ikb(btns))
 
 
+async def _show(cb: CallbackQuery, text: str, markup) -> None:
+    try:
+        await cb.message.edit_text(text, reply_markup=markup)
+    except Exception:
+        await cb.message.answer(text, reply_markup=markup)
+
+
 @router.callback_query(F.data == "gd:driver")
-async def cb_guide_driver(cb: CallbackQuery, bot: Bot):
+async def cb_guide_driver(cb: CallbackQuery):
     await cb.answer()
-    await send_content(bot, cb.message.chat.id, guide.DRIVER)
+    await cb.message.answer(guide.menu_text("driver"), reply_markup=ikb(guide.menu_rows("driver")))
+
+
+@router.callback_query(F.data.startswith("gt:driver:"))
+async def cb_guide_driver_topic(cb: CallbackQuery):
+    await cb.answer()
+    idx = int(cb.data.split(":")[2])
+    if idx == -1:
+        await _show(cb, guide.menu_text("driver"), ikb(guide.menu_rows("driver")))
+        return
+    await _show(cb, guide.topic("driver", idx), ikb([[("⬅️ К обзору функций", "gt:driver:-1")]]))
 
 
 @router.callback_query(F.data.startswith("i:"))

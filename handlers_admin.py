@@ -606,17 +606,35 @@ async def instr_menu(message: Message, state: FSMContext):
 async def customer_instr(message: Message, state: FSMContext):
     """Заказчик: обзор функций своей роли."""
     await state.clear()
-    await send_content(message.bot, message.chat.id, guide.CUSTOMER)
+    await message.answer(guide.menu_text("customer"), reply_markup=ikb(guide.menu_rows("customer")))
+
+
+def _guide_allowed(uid: int, role: str) -> bool:
+    return role in guide.TOPICS and (role == "customer" or is_admin(uid))
 
 
 @router.callback_query(F.data.startswith("gd:"))
 async def cb_guide(cb: CallbackQuery):
     role = cb.data[3:]
-    if role not in guide.TEXTS or (role != "customer" and not is_admin(cb.from_user.id)):
+    if not _guide_allowed(cb.from_user.id, role):
         await cb.answer("Недостаточно прав", show_alert=True)
         return
     await cb.answer()
-    await send_content(cb.bot, cb.message.chat.id, guide.TEXTS[role])
+    await cb.message.answer(guide.menu_text(role), reply_markup=ikb(guide.menu_rows(role)))
+
+
+@router.callback_query(F.data.startswith("gt:"))
+async def cb_guide_topic(cb: CallbackQuery):
+    _, role, idx = cb.data.split(":")
+    if not _guide_allowed(cb.from_user.id, role):
+        await cb.answer("Недостаточно прав", show_alert=True)
+        return
+    await cb.answer()
+    idx = int(idx)
+    if idx == -1:
+        await safe_edit(cb, guide.menu_text(role), ikb(guide.menu_rows(role)))
+        return
+    await safe_edit(cb, guide.topic(role, idx), ikb([[("⬅️ К обзору функций", f"gt:{role}:-1")]]))
 
 
 @router.callback_query(F.data == "irep", ADM)
