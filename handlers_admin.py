@@ -12,6 +12,7 @@ from aiogram.types import CallbackQuery, ChatMemberUpdated, FSInputFile, InputMe
 
 import acks
 import backup
+import guide
 import db
 import geo
 import notes as N
@@ -584,7 +585,9 @@ async def send_export(message: Message, wb):
 # ------------------------------------------------------------ instructions
 
 def instr_list_markup():
-    rows = [[(short(r["title"], 55), f"iv:{r['id']}")] for r in db.q("SELECT id, title FROM instructions ORDER BY id")]
+    rows = [[(guide.TITLES["admin"], "gd:admin")],
+            [("🧭 Обзор: водитель", "gd:driver"), ("🧭 Обзор: заказчик", "gd:customer")]]
+    rows += [[(short(r["title"], 55), f"iv:{r['id']}")] for r in db.q("SELECT id, title FROM instructions ORDER BY id")]
     rows.append([("➕ Добавить инструкцию", "ia")])
     rows.append([("📊 Отчёт ознакомления", "irep")])
     return ikb(rows)
@@ -597,6 +600,23 @@ async def instr_menu(message: Message, state: FSMContext):
     await message.answer(f"📖 <b>Инструкции</b> ({n}). Нажмите на инструкцию, чтобы просмотреть, изменить или удалить её. "
                          f"Новые и изменённые инструкции автоматически приходят водителям на ознакомление.",
                          reply_markup=instr_list_markup())
+
+
+@router.message(F.text == A_INSTR)
+async def customer_instr(message: Message, state: FSMContext):
+    """Заказчик: обзор функций своей роли."""
+    await state.clear()
+    await send_content(message.bot, message.chat.id, guide.CUSTOMER)
+
+
+@router.callback_query(F.data.startswith("gd:"))
+async def cb_guide(cb: CallbackQuery):
+    role = cb.data[3:]
+    if role not in guide.TEXTS or (role != "customer" and not is_admin(cb.from_user.id)):
+        await cb.answer("Недостаточно прав", show_alert=True)
+        return
+    await cb.answer()
+    await send_content(cb.bot, cb.message.chat.id, guide.TEXTS[role])
 
 
 @router.callback_query(F.data == "irep", ADM)

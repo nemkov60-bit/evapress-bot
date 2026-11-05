@@ -10,6 +10,7 @@ from aiogram.types import CallbackQuery, InputMediaDocument, InputMediaPhoto, In
 
 import acks
 import db
+import guide
 import geo
 import notes as N
 import services as S
@@ -916,15 +917,20 @@ async def instructions(message: Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
     rows = db.q("SELECT id, title FROM instructions ORDER BY id")
-    if not rows:
-        await message.answer("Инструкций пока нет.")
-        return
     unacked = {r["id"] for r in S.instr_unacked(uid)}
     head = (f"📖 <b>Инструкции</b>\nВсего: <b>{len(rows)}</b> · не ознакомлены: <b>{len(unacked)}</b>"
-            + ("\n\n🆕 — нужно ознакомиться и нажать «✅ Ознакомлен(а)»." if unacked else "\n\n✅ Со всеми ознакомлены."))
-    btns = [[(("🆕 " if r["id"] in unacked else "✅ ") + short(r["title"], 56), f"i:{r['id']}")]
-            for r in sorted(rows, key=lambda r: r["id"] not in unacked)]
+            + ("\n\n🆕 — нужно ознакомиться и нажать «✅ Ознакомлен(а)»." if unacked
+               else "\n\n✅ Со всеми ознакомлены." if rows else ""))
+    btns = [[(guide.TITLES["driver"], "gd:driver")]]
+    btns += [[(("🆕 " if r["id"] in unacked else "✅ ") + short(r["title"], 56), f"i:{r['id']}")]
+             for r in sorted(rows, key=lambda r: r["id"] not in unacked)]
     await message.answer(head, reply_markup=ikb(btns))
+
+
+@router.callback_query(F.data == "gd:driver")
+async def cb_guide_driver(cb: CallbackQuery, bot: Bot):
+    await cb.answer()
+    await send_content(bot, cb.message.chat.id, guide.DRIVER)
 
 
 @router.callback_query(F.data.startswith("i:"))
