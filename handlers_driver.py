@@ -131,6 +131,7 @@ def route_view(rid: int):
         icon = "✅" if p["status"] == "closed" else ("⏳" if p["close_req_at"] else ("🟡" if p["opened_at"] else "⬜"))
         mark = "❗" if p["id"] in flagged else ""
         rows.append([(f"{icon}{mark} {p['seq']}. {short(p['address'], 43)}", f"p:{p['id']}")])
+    rows.append([("📄 Фото маршрутного листа", f"dsh:{rid}")])
     rows.append([("🔄 Обновить", f"r:{rid}")])
     return text, ikb(rows)
 
@@ -574,6 +575,16 @@ async def after_point_closed(bot: Bot, rid: int) -> bool:
     return True
 
 
+@router.callback_query(F.data.startswith("dsh:"))
+async def cb_driver_sheet(cb: CallbackQuery, bot: Bot):
+    rid = int(cb.data[4:])
+    if not own_route(cb.from_user.id, rid):
+        await cb.answer("Маршрут недоступен", show_alert=True)
+        return
+    await cb.answer()
+    await send_sheet_photos(bot, cb.message.chat.id, rid)
+
+
 @router.callback_query(F.data.startswith("dph:"))
 async def cb_driver_point_photos(cb: CallbackQuery, bot: Bot):
     p = own_point(cb.from_user.id, int(cb.data[4:]))
@@ -904,6 +915,21 @@ async def send_point_photos(bot: Bot, chat_id: int, p, empty_text: bool = True) 
            + (f"\n💬 Закрыта без фото: {h(p['close_note'])}" if p["close_note"] else ""))
     await bot.send_message(chat_id, cap)
     await send_files(bot, chat_id, files)
+    return True
+
+
+async def send_sheet_photos(bot: Bot, chat_id: int, rid: int) -> bool:
+    """Фото маршрутного листа маршрута. False — фото нет."""
+    r = S.route_with_wb(rid)
+    sheets = S.sheet_photos(rid)
+    if not sheets:
+        await bot.send_message(chat_id, f"📄 По маршруту №{h(r['route_no'])} ({h(S.route_title(r))}) фото маршрутного "
+                                        f"листа пока нет.")
+        return False
+    await bot.send_message(chat_id, f"📄 <b>Фото маршрутного листа</b> — маршрут №{h(r['route_no'])} · рейс "
+                                    f"{h(S.route_title(r))}\n👤 {h(S.driver_name(r['driver_id']))} · страниц: {len(sheets)}, "
+                                    f"загружено {S.fmt_date(sheets[0]['created_at'][:10])} в {S.fmt_time(sheets[0]['created_at'])}")
+    await send_files(bot, chat_id, [(x["file_id"], x["file_type"], x["file_name"]) for x in sheets])
     return True
 
 

@@ -147,7 +147,7 @@ def route_card(rid: int):
     if S.is_offline(r["driver_id"]):
         text += ("\n\n📵 <b>Водитель без Telegram</b> — отмечайте точки и загружайте фото за него: "
                  "«📍 Точки маршрута» → точка. Точки закрываются на его имя.")
-    rows = [[("📍 Точки маршрута", f"rpts:{rid}")]]
+    rows = [[("📍 Точки маршрута", f"rpts:{rid}")], [("📄 Фото маршрутного листа", f"shv:{rid}")]]
     if not r["closed_at"] and not r["wb_closed_at"]:
         rows.append([("📄 Загрузить фото маршрутного листа", f"ash:{rid}")])
     if r["closed_at"]:

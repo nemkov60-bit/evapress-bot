@@ -406,7 +406,8 @@ async def cmd_report(message: Message, command: CommandObject, state: FSMContext
 
 
 def report_kb(uid: int, r):
-    rows = [[("🖼 Фото по маршруту", f"ph:{r['id']}"), ("🖼 Фото по точке", f"pphl:{r['id']}")]]
+    rows = [[("📄 Фото маршрутного листа", f"shv:{r['id']}")],
+            [("🖼 Фото по маршруту", f"ph:{r['id']}"), ("🖼 Фото по точке", f"pphl:{r['id']}")]]
     rows.append([("📝 Примечания к маршруту", f"ntr:{r['id']}")])  # заказчику — только просмотр
     if is_admin(uid):
         rows.append([("🛣 Управление маршрутом и точками", f"rt:{r['id']}")])
@@ -530,6 +531,13 @@ async def cb_photos(cb: CallbackQuery, bot: Bot):
         sent += 1
     if not sent:
         await cb.message.answer("По маршруту пока нет фотографий.")
+
+
+@router.callback_query(F.data.startswith("shv:"))
+async def cb_sheet_view(cb: CallbackQuery, bot: Bot):
+    from handlers_driver import send_sheet_photos
+    await cb.answer()
+    await send_sheet_photos(bot, cb.message.chat.id, int(cb.data[4:]))
 
 
 @router.callback_query(F.data.startswith("pphl:"))
