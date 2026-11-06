@@ -169,6 +169,9 @@ def migrate() -> None:
     );
     """)
     conn.execute("UPDATE instructions SET version_at=COALESCE(updated_at, created_at) WHERE version_at IS NULL")
+    # v13: порядок объезда точек (как в маршрутном листе), по номеру маршрута и адресу
+    conn.execute("""CREATE TABLE IF NOT EXISTS route_order(
+        route_no TEXT, point_key TEXT, pos INTEGER, set_at TEXT, PRIMARY KEY(route_no, point_key))""")
     # v11: водители без Telegram (заводит администратор, отмечает точки за них); приглашение с переносом истории
     _add_col("users", "offline", "offline INTEGER DEFAULT 0")
     _add_col("invites", "merge_uid", "merge_uid INTEGER")

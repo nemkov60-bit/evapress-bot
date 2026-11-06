@@ -10,6 +10,7 @@ from aiogram.types import CallbackQuery, InputMediaDocument, InputMediaPhoto, In
 
 import acks
 import db
+import order as O
 import guide
 import geo
 import notes as N
@@ -126,12 +127,16 @@ def route_view(rid: int):
         text = rblock + "\n\n" + text
     if flagged:
         text += "\n❗ — у точки есть важная информация или заметки водителей."
+    pts, custom = O.ordered_points(rid)
+    if custom:
+        text += "\n🔀 Точки — в порядке объезда по маршрутному листу."
     rows = []
-    for p in db.q("SELECT * FROM points WHERE route_id=? ORDER BY seq", (rid,)):
+    for i, p in enumerate(pts, 1):
         icon = "✅" if p["status"] == "closed" else ("⏳" if p["close_req_at"] else ("🟡" if p["opened_at"] else "⬜"))
         mark = "❗" if p["id"] in flagged else ""
-        rows.append([(f"{icon}{mark} {p['seq']}. {short(p['address'], 43)}", f"p:{p['id']}")])
-    rows.append([("📄 Фото маршрутного листа", f"dsh:{rid}")])
+        num = i if custom else p["seq"]
+        rows.append([(f"{icon}{mark} {num}. {short(p['address'], 43)}", f"p:{p['id']}")])
+    rows.append([("🔀 Порядок точек", f"ord:{rid}"), ("📄 Фото маршрутного листа", f"dsh:{rid}")])
     rows.append([("🔄 Обновить", f"r:{rid}")])
     return text, ikb(rows)
 
@@ -140,6 +145,10 @@ def point_view(p):
     r = S.route_with_wb(p["route_id"])
     block = N.point_block(p, r["work_date"])
     text = S.point_text(p, r) + ("\n\n" + block if block else "")
+    pts, custom = O.ordered_points(p["route_id"])
+    if custom:
+        pos = next(i for i, x in enumerate(pts, 1) if x["id"] == p["id"])
+        text = text.replace("\n\n", f"\n🔀 По порядку объезда: <b>{pos}</b>\n\n", 1)
     rows = [[("🧭 Маршрут до точки", f"nav:{p['id']}")]]
     if p["status"] != "closed":
         rows.append([("📍 Открыть точку", f"po:{p['id']}")])
@@ -575,6 +584,48 @@ async def after_point_closed(bot: Bot, rid: int) -> bool:
     return True
 
 
+# ------------------------------------------------------------ порядок точек
+
+async def _order_edit(cb: CallbackQuery, rid: int) -> None:
+    text, markup = O.view(cb.from_user.id, rid, f"r:{rid}")
+    try:
+        await cb.message.edit_text(text, reply_markup=markup)
+    except Exception:
+        await cb.message.answer(text, reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith(("ord:", "orp:", "oru:", "ork:", "orr:")))
+async def cb_order(cb: CallbackQuery):
+    kind, rest = cb.data.split(":", 1)
+    rid = int(rest.split(":")[0])
+    uid = cb.from_user.id
+    if not own_route(uid, rid):
+        await cb.answer("Маршрут недоступен", show_alert=True)
+        return
+    if kind == "ord":
+        O.start(uid, rid)
+    elif kind == "orp":
+        O.pick(uid, rid, int(rest.split(":")[1]))
+    elif kind == "oru":
+        O.undo(uid, rid)
+    elif kind in ("ork", "orr"):
+        if kind == "ork":
+            n = O.finish(uid, rid)
+            await cb.answer(f"Порядок сохранён ({n} точек)" if n else "Ничего не выбрано — порядок не изменён")
+        else:
+            O.reset(rid)
+            O.start(uid, rid)
+            await cb.answer("Порядок как в файле")
+        text, markup = route_view(rid)
+        try:
+            await cb.message.edit_text(text, reply_markup=markup)
+        except Exception:
+            await cb.message.answer(text, reply_markup=markup)
+        return
+    await cb.answer()
+    await _order_edit(cb, rid)
+
+
 @router.callback_query(F.data.startswith("dsh:"))
 async def cb_driver_sheet(cb: CallbackQuery, bot: Bot):
     rid = int(cb.data[4:])
@@ -808,8 +859,9 @@ async def problem_menu(message: Message, state: FSMContext):
     routes = S.driver_routes(message.from_user.id)
     rows = []
     for r in routes:
-        for p in db.q("SELECT * FROM points WHERE route_id=? AND status!='closed' ORDER BY seq", (r["id"],)):
-            rows.append([(f"{p['seq']}. {short(p['address'], 45)}", f"pp:{p['id']}")])
+        for p in O.ordered_points(r["id"])[0]:
+            if p["status"] != "closed":
+                rows.append([(f"{p['seq']}. {short(p['address'], 45)}", f"pp:{p['id']}")])
     rows.append([("📝 Без привязки к адресу", "pp:0")])
     await message.answer("На каком адресе проблема?", reply_markup=ikb(rows[:95]))
 

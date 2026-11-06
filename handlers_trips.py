@@ -12,6 +12,7 @@ from aiogram.types import CallbackQuery, Message
 
 import backup
 import db
+import order as O
 import geo
 import notes as N
 import services as S
@@ -225,6 +226,34 @@ async def cb_route_close(cb: CallbackQuery, bot: Bot):
             pass
 
 
+# ------------------------------------------------------------ порядок точек (админ)
+
+@router.callback_query(F.data.startswith(("ord:", "orp:", "oru:", "ork:", "orr:")), ADM)
+async def cb_admin_order(cb: CallbackQuery):
+    kind, rest = cb.data.split(":", 1)
+    rid = int(rest.split(":")[0])
+    uid = cb.from_user.id
+    if kind == "ord":
+        O.start(uid, rid)
+    elif kind == "orp":
+        O.pick(uid, rid, int(rest.split(":")[1]))
+    elif kind == "oru":
+        O.undo(uid, rid)
+    elif kind in ("ork", "orr"):
+        if kind == "ork":
+            n = O.finish(uid, rid)
+            await cb.answer(f"Порядок сохранён ({n} точек)" if n else "Ничего не выбрано")
+        else:
+            O.reset(rid)
+            O.start(uid, rid)
+            await cb.answer("Порядок как в файле")
+        await show_points(cb.message, rid)
+        return
+    await cb.answer()
+    text, markup = O.view(uid, rid, f"rpts:{rid}")
+    await safe_edit(cb, text, markup)
+
+
 # ------------------------------------------------------------ точки ------
 
 def point_icon(p) -> str:
@@ -235,12 +264,18 @@ def point_icon(p) -> str:
 
 @router.callback_query(F.data.startswith("rpts:"), ADM)
 async def cb_points(cb: CallbackQuery):
-    rid = int(cb.data[5:])
     await cb.answer()
-    pts = db.q("SELECT * FROM points WHERE route_id=? ORDER BY seq", (rid,))
-    rows = [[(f"{point_icon(p)} {p['seq']}. {short(p['address'], 44)}", f"apc:{p['id']}")] for p in pts]
-    await cb.message.answer("📍 Точки маршрута\n✅ закрыта · ⚠️ закрыта без фото · ⏳ запрос на закрытие · ⬜ открыта",
-                            reply_markup=ikb(rows[:95]))
+    await show_points(cb.message, int(cb.data[5:]))
+
+
+async def show_points(message: Message, rid: int):
+    pts, custom = O.ordered_points(rid)
+    rows = [[(f"{point_icon(p)} {i if custom else p['seq']}. {short(p['address'], 40)}"
+              + (f" (№{p['seq']})" if custom else ""), f"apc:{p['id']}")] for i, p in enumerate(pts, 1)]
+    rows.append([("🔀 Порядок точек", f"ord:{rid}")])
+    await message.answer("📍 Точки маршрута" + (" — в порядке объезда (в скобках № в файле)" if custom else "")
+                            + "\n✅ закрыта · ⚠️ закрыта без фото · ⏳ запрос на закрытие · ⬜ открыта",
+                            reply_markup=ikb(rows[-96:] if len(rows) > 96 else rows))
 
 
 def admin_point_card(pid: int):
