@@ -406,7 +406,7 @@ async def cmd_report(message: Message, command: CommandObject, state: FSMContext
 
 
 def report_kb(uid: int, r):
-    rows = [[("🖼 Фото по маршруту", f"ph:{r['id']}")]]
+    rows = [[("🖼 Фото по маршруту", f"ph:{r['id']}"), ("🖼 Фото по точке", f"pphl:{r['id']}")]]
     rows.append([("📝 Примечания к маршруту", f"ntr:{r['id']}")])  # заказчику — только просмотр
     if is_admin(uid):
         rows.append([("🛣 Управление маршрутом и точками", f"rt:{r['id']}")])
@@ -512,31 +512,17 @@ async def cb_route_reopen(cb: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data.startswith("ph:"))
 async def cb_photos(cb: CallbackQuery, bot: Bot):
-    from handlers_driver import send_files
+    from handlers_driver import send_files, send_point_photos
     rid = int(cb.data[3:])
     await cb.answer()
     sent = 0
     for p in db.q("SELECT * FROM points WHERE route_id=? ORDER BY seq", (rid,)):
-        files = [(p[f], "photo", None) for f in ("photo_display", "photo_invoice", "photo_poa") if p[f]]
-        extras = S.extra_photos(p["id"])
-        n_extra = len(extras)
-        files += [(x["file_id"], x["file_type"], x["file_name"]) for x in extras]
-        probs = db.q("SELECT * FROM photos WHERE kind='problem' AND point_id=? ORDER BY id", (p["id"],))
-        if not files and not probs:
-            continue
-        cap = (f"📍 {p['seq']}. {h(p['network'])} — {h(p['address'])}\n"
-               f"{'✅ закрыта ' + S.fmt_time(p['closed_at']) if p['status'] == 'closed' else '⬜ не закрыта'}"
-               f"{' · доверенность отсутствует' if p['poa_absent'] else ''}"
-               + (f"\n📎 доп. фото: {n_extra}" if n_extra else "")
-               + (f"\n⚠️ фото к проблеме: {len(probs)}" if probs else ""))
-        await cb.message.answer(cap)
         try:
-            await send_files(bot, cb.message.chat.id, files + [(x["file_id"], x["file_type"], x["file_name"])
-                                                                for x in probs])
+            if await send_point_photos(bot, cb.message.chat.id, p, empty_text=False):
+                sent += 1
+                await asyncio.sleep(0.4)
         except Exception as e:  # noqa: BLE001
             await cb.message.answer(f"Не удалось отправить фото точки {p['seq']}: {h(str(e))}")
-        sent += 1
-        await asyncio.sleep(0.4)
     loose = db.q("SELECT * FROM photos WHERE kind='problem' AND route_id=? AND point_id IS NULL ORDER BY id", (rid,))
     if loose:
         await cb.message.answer(f"⚠️ Фото к проблемам без привязки к адресу: {len(loose)}")
@@ -544,6 +530,33 @@ async def cb_photos(cb: CallbackQuery, bot: Bot):
         sent += 1
     if not sent:
         await cb.message.answer("По маршруту пока нет фотографий.")
+
+
+@router.callback_query(F.data.startswith("pphl:"))
+async def cb_point_photo_list(cb: CallbackQuery):
+    """Список точек маршрута с количеством фото — выбрать точку."""
+    from handlers_driver import point_photo_files
+    rid = int(cb.data[5:])
+    await cb.answer()
+    rows = []
+    for p in db.q("SELECT * FROM points WHERE route_id=? ORDER BY seq", (rid,)):
+        n = len(point_photo_files(p)[0])
+        icon = "✅" if p["status"] == "closed" else "⬜"
+        rows.append([(f"{icon} {p['seq']}. {short(p['address'], 36)} · 📷 {n}", f"pph:{p['id']}")])
+    r = S.route_with_wb(rid)
+    await cb.message.answer(f"🖼 <b>Фото по точке</b> — маршрут №{h(r['route_no'])} ({h(S.route_title(r))}).\n"
+                            f"Выберите точку (📷 — сколько фото):", reply_markup=ikb(rows[:95]))
+
+
+@router.callback_query(F.data.startswith("pph:"))
+async def cb_point_photos(cb: CallbackQuery, bot: Bot):
+    from handlers_driver import send_point_photos
+    p = db.q1("SELECT * FROM points WHERE id=?", (int(cb.data[4:]),))
+    await cb.answer()
+    if not p:
+        await cb.message.answer("Точка не найдена.")
+        return
+    await send_point_photos(bot, cb.message.chat.id, p)
 
 
 # ------------------------------------------------------------ export ------

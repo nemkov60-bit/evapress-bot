@@ -143,7 +143,7 @@ def point_view(p):
     if p["status"] != "closed":
         rows.append([("📍 Открыть точку", f"po:{p['id']}")])
     rows.append([("⚠️ Проблема на адресе", f"pp:{p['id']}")])
-    rows.append([("📝 Заметка к адресу", f"dn:{p['id']}")])
+    rows.append([("📝 Заметка к адресу", f"dn:{p['id']}"), ("🖼 Фото по точке", f"dph:{p['id']}")])
     rows.append([("⬅️ К списку точек", f"r:{p['route_id']}")])
     return text, ikb(rows)
 
@@ -574,6 +574,16 @@ async def after_point_closed(bot: Bot, rid: int) -> bool:
     return True
 
 
+@router.callback_query(F.data.startswith("dph:"))
+async def cb_driver_point_photos(cb: CallbackQuery, bot: Bot):
+    p = own_point(cb.from_user.id, int(cb.data[4:]))
+    if not p:
+        await cb.answer("Точка недоступна", show_alert=True)
+        return
+    await cb.answer()
+    await send_point_photos(bot, cb.message.chat.id, p)
+
+
 @router.callback_query(F.data.startswith("nav:"))
 async def cb_nav(cb: CallbackQuery, bot: Bot):
     p = own_point(cb.from_user.id, int(cb.data[4:]))
@@ -864,6 +874,37 @@ async def problem_send(message: Message, state: FSMContext, bot: Bot):
                 await send_files(bot, aid, files)
             except Exception:
                 pass
+
+
+def point_photo_files(p) -> tuple[list, int, int]:
+    """Все фото точки: обязательные, дополнительные, к проблемам. -> (файлы, доп., к проблемам)"""
+    files = [(p[f], "photo", None) for f in ("photo_display", "photo_invoice", "photo_poa") if p[f]]
+    extras = S.extra_photos(p["id"])
+    probs = db.q("SELECT * FROM photos WHERE kind='problem' AND point_id=? ORDER BY id", (p["id"],))
+    files += [(x["file_id"], x["file_type"], x["file_name"]) for x in extras]
+    files += [(x["file_id"], x["file_type"], x["file_name"]) for x in probs]
+    return files, len(extras), len(probs)
+
+
+async def send_point_photos(bot: Bot, chat_id: int, p, empty_text: bool = True) -> bool:
+    """Подпись с адресом и статусом + все фото точки. False — фото нет."""
+    files, n_extra, n_prob = point_photo_files(p)
+    if not files:
+        if empty_text:
+            await bot.send_message(chat_id, f"🖼 По точке {p['seq']}. {h(p['address'])} фото пока нет.")
+        return False
+    labels = [lbl for f, lbl in (("photo_display", "выкладка"), ("photo_invoice", "накладная"),
+                                 ("photo_poa", "доверенность")) if p[f]]
+    cap = (f"🖼 <b>Фото по точке {p['seq']}</b>. {h(p['network'] or '')} — {h(p['address'])}\n"
+           f"{'✅ закрыта ' + S.fmt_time(p['closed_at']) if p['status'] == 'closed' else '⬜ не закрыта'}"
+           f"{' · доверенность отсутствует' if p['poa_absent'] else ''}"
+           + (f"\n📸 {', '.join(labels)}" if labels else "")
+           + (f"\n📎 доп. фото: {n_extra}" if n_extra else "")
+           + (f"\n⚠️ фото к проблеме: {n_prob}" if n_prob else "")
+           + (f"\n💬 Закрыта без фото: {h(p['close_note'])}" if p["close_note"] else ""))
+    await bot.send_message(chat_id, cap)
+    await send_files(bot, chat_id, files)
+    return True
 
 
 async def send_files(bot: Bot, chat_id: int, files: list[tuple[str, str, str | None]]) -> None:

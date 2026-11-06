@@ -154,7 +154,8 @@ def route_card(rid: int):
         rows.append([("↩️ Открыть маршрут снова", f"rro:{rid}")])
     elif not r["wb_closed_at"]:
         rows.append([("🔒 Закрыть маршрут", f"rcl:{rid}")])
-    rows.append([("🖼 Фото по маршруту", f"ph:{rid}"), ("📝 Примечания", f"ntr:{rid}")])
+    rows.append([("🖼 Фото по маршруту", f"ph:{rid}"), ("🖼 Фото по точке", f"pphl:{rid}")])
+    rows.append([("📝 Примечания", f"ntr:{rid}")])
     return text, ikb(rows)
 
 
@@ -269,6 +270,7 @@ def admin_point_card(pid: int):
     text += ("\n🧭 Точка на карте: указана логистом" if c and c[2] == "admin" else
              "\n🧭 Точка на карте: найдена автоматически по адресу (проверьте кнопкой «Маршрут»)" if c else
              "\n🧭 Точка на карте: ещё не найдена")
+    rows.append([("🖼 Фото по точке", f"pph:{pid}")])
     rows.append([("🧭 Маршрут до точки", f"nav:{pid}"), ("📍 Указать на карте", f"agl:{pid}")])
     rows.append([("⬅️ К точкам маршрута", f"rpts:{p['route_id']}")])
     return text, ikb(rows)
