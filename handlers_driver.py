@@ -158,34 +158,55 @@ def point_view(p):
     return text, ikb(rows)
 
 
+# выбранный водителем пункт фото: uid -> (point_id, код слота). Отдельно от FSM, чтобы альбом не «перетёр» выбор
+_slot: dict[int, tuple[int, str]] = {}
+_album_with_slot: set[str] = set()   # альбомы, первое фото которых ушло в выбранный пункт
+
+
 async def ask_step(message: Message, state: FSMContext, p):
-    """Показывает следующий шаг закрытия точки."""
-    step = S.next_step(p)
-    if step:
-        await state.set_state(PointFlow.photo)
-        await state.update_data(point_id=p["id"])
-        rows = []
-        if step == "poa":
-            rows.append([("🚫 Доверенность отсутствует", f"na:{p['id']}")])
-        if p["close_req_at"]:
-            req = "\n\n⏳ <i>Запрос на закрытие точки без фото отправлен логисту — ожидайте решения.</i>"
+    """Меню фото точки: водитель сам выбирает, какое фото загружает."""
+    await state.set_state(PointFlow.photo)
+    await state.update_data(point_id=p["id"])
+    pid = p["id"]
+    rows = []
+    for i, (code, field, label) in enumerate(S.PHOTO_SLOTS, 1):
+        if code == "poa" and not p[field] and p["poa_absent"]:
+            mark = "➖"
         else:
-            req = ""
-            rows.append([("📨 Закрыть без фото (запрос логисту)", f"pq:{p['id']}")])
-        rows.append([("⬅️ К списку точек", f"r:{p['route_id']}")])
-        await message.answer(f"<b>{h(short(p['address'], 80))}</b>\n\n{S.photos_progress(p)}\n\n{STEP_PROMPTS[step]}"
-                             + req, reply_markup=ikb(rows))
-    else:
-        # обязательные фото есть — остаёмся в режиме приёма: всё, что пришлёт водитель, — доп. фото
-        await state.set_state(PointFlow.photo)
-        await state.update_data(point_id=p["id"])
-        await message.answer(
-            f"<b>{h(short(p['address'], 80))}</b>\n\n{S.photos_progress(p)}\n\n"
-            f"Обязательные фото загружены. Если ситуация нестандартная, отправьте дополнительные фото — "
-            f"их количество не ограничено. Затем нажмите «Закрыть точку».\n\n{PHOTO_HINT}",
-            reply_markup=ikb([[("✅ Закрыть точку", f"pc:{p['id']}")],
-                              [("🔁 Переснять фото", f"pr:{p['id']}")],
-                              [("⬅️ К списку точек", f"r:{p['route_id']}")]]))
+            mark = "✅" if p[field] else "📷"
+        rows.append([(f"{mark} {i}. {label}", f"ps:{pid}:{code}")])
+    rows.append([("📎 Дополнительное фото", f"ps:{pid}:extra")])
+    if not p["photo_poa"] and not p["poa_absent"]:
+        rows.append([("🚫 Доверенность отсутствует", f"na:{pid}")])
+    rows.append([("✅ Закрыть точку", f"pc:{pid}")])
+    if S.next_step(p) and not p["close_req_at"]:
+        rows.append([("📨 Закрыть без фото (запрос логисту)", f"pq:{pid}")])
+    rows.append([("⬅️ К списку точек", f"r:{p['route_id']}")])
+    req = ("\n\n⏳ <i>Запрос на закрытие точки отправлен логисту — ожидайте решения.</i>" if p["close_req_at"] else "")
+    await message.answer(
+        f"<b>{h(short(p['address'], 80))}</b>\n\n{S.photos_progress(p)}\n\n"
+        f"Выберите в списке, какое фото загружаете (✅ — уже загружено, нажмите, чтобы переснять). "
+        f"Фото 1–3 обязательны; без 4–5 точку можно закрыть только с подтверждением логиста.\n\n{PHOTO_HINT}" + req,
+        reply_markup=ikb(rows))
+
+
+@router.callback_query(F.data.startswith("ps:"))
+async def cb_pick_slot(cb: CallbackQuery, state: FSMContext):
+    _, pid, code = cb.data.split(":")
+    p = own_point(cb.from_user.id, int(pid))
+    if not p or p["status"] == "closed":
+        await cb.answer("Точка недоступна или уже закрыта", show_alert=True)
+        return
+    await state.set_state(PointFlow.photo)
+    await state.update_data(point_id=p["id"])
+    _slot[cb.from_user.id] = (p["id"], code)
+    await cb.answer()
+    if code == "extra":
+        await cb.message.answer("📎 Отправьте дополнительные фото (можно несколько, а также видео или файлы).\n\n"
+                                + PHOTO_HINT)
+        return
+    again = " (заменит загруженное)" if p[S.SLOT_FIELD[code]] else ""
+    await cb.message.answer(f"📸 Отправьте фото: <b>{S.SLOT_LABEL[code]}</b>{again}.\n\n{PHOTO_HINT}")
 
 
 # ------------------------------------------------------------ start/reg ---
@@ -463,18 +484,29 @@ async def got_photo(message: Message, state: FSMContext):
         await state.clear()
         await message.answer("Точка не найдена или уже закрыта.")
         return
-    step = S.next_step(p)
-    # чтение и запись без await между ними — альбом из нескольких фото не «перетрёт» шаги
-    if step:
-        db.x(f"UPDATE points SET {STEP_FIELD[step]}=? WHERE id=?", (message.photo[-1].file_id, p["id"]))
-    else:
-        S.add_photo("extra", message.photo[-1].file_id, "photo", message.from_user.id,
-                    point_id=p["id"], route_id=p["route_id"])
     uid, pid = message.from_user.id, p["id"]
+    # чтение и запись без await между ними: первое фото альбома — в выбранный пункт, остальные — дополнительные
+    sel = _slot.get(uid)
+    code = sel[1] if sel and sel[0] == pid else None
+    note = None
+    if code and code != "extra":
+        _slot.pop(uid, None)
+        if message.media_group_id:
+            _album_with_slot.add(message.media_group_id)
+        db.x(f"UPDATE points SET {S.SLOT_FIELD[code]}=? WHERE id=?", (message.photo[-1].file_id, pid))
+        if code == "poa":
+            db.x("UPDATE points SET poa_absent=0 WHERE id=?", (pid,))
+    else:
+        S.add_photo("extra", message.photo[-1].file_id, "photo", uid, point_id=pid, route_id=p["route_id"])
+        if not code and message.media_group_id not in _album_with_slot:
+            note = ("ℹ️ Фото сохранено как <b>дополнительное</b>. Чтобы загрузить конкретное фото (выкладка, накладная, "
+                    "акт…), сначала выберите его в списке.")
 
     async def reply():
         fresh = own_point(uid, pid)
         if fresh and fresh["status"] != "closed":
+            if note:
+                await message.answer(note)
             await ask_step(message, state, fresh)
 
     debounce(uid, reply)
@@ -488,8 +520,9 @@ async def got_doc(message: Message, state: FSMContext):
         await state.clear()
         await message.answer("Точка не найдена или уже закрыта.")
         return
-    if S.next_step(p):
-        await message.answer("Обязательные снимки отправьте как <b>фото</b> (не файлом).")
+    sel = _slot.get(message.from_user.id)
+    if sel and sel[0] == p["id"] and sel[1] != "extra":
+        await message.answer("Это фото отправьте как <b>фото</b> (не файлом) — так оно будет в нормальном качестве.")
         return
     fid, ftype, fname = media_of(message)
     S.add_photo("extra", fid, ftype, message.from_user.id, point_id=p["id"], route_id=p["route_id"], file_name=fname)
@@ -514,9 +547,6 @@ async def cb_no_poa(cb: CallbackQuery, state: FSMContext):
     if not p or p["status"] == "closed":
         await cb.answer("Точка не найдена или уже закрыта", show_alert=True)
         return
-    if not p["photo_display"] or not p["photo_invoice"]:
-        await cb.answer("Сначала загрузите фото выкладки и накладной", show_alert=True)
-        return
     db.x("UPDATE points SET poa_absent=1, photo_poa=NULL WHERE id=?", (p["id"],))
     await cb.answer("Отмечено: доверенность отсутствует")
     await ask_step(cb.message, state, own_point(cb.from_user.id, p["id"]))
@@ -528,8 +558,8 @@ async def cb_reshoot(cb: CallbackQuery, state: FSMContext):
     if not p or p["status"] == "closed":
         await cb.answer("Точка не найдена или уже закрыта", show_alert=True)
         return
-    db.x("UPDATE points SET photo_display=NULL, photo_invoice=NULL, photo_poa=NULL, poa_absent=0 WHERE id=?",
-         (p["id"],))
+    db.x("UPDATE points SET photo_display=NULL, photo_invoice=NULL, photo_poa=NULL, poa_absent=0, photo_act=NULL, "
+         "photo_return=NULL WHERE id=?", (p["id"],))
     db.x("DELETE FROM photos WHERE kind='extra' AND point_id=?", (p["id"],))
     await cb.answer("Фото сброшены")
     await ask_step(cb.message, state, own_point(cb.from_user.id, p["id"]))
@@ -546,8 +576,21 @@ async def cb_close(cb: CallbackQuery, state: FSMContext, bot: Bot):
         await cb.answer("Точка уже закрыта")
         return
     if S.next_step(p):
-        await cb.answer("Загрузите все фото перед закрытием точки", show_alert=True)
+        await cb.answer("Не загружены обязательные фото (1–3). Загрузите их или нажмите «📨 Закрыть без фото».",
+                        show_alert=True)
         await ask_step(cb.message, state, p)
+        return
+    missing = S.missing_approval(p)
+    if missing:
+        if p["close_req_at"]:
+            await cb.answer("Запрос уже отправлен логисту — ожидайте решения", show_alert=True)
+            return
+        await cb.answer()
+        await cb.message.answer(
+            f"⚠️ Не загружено: <b>{', '.join(missing)}</b>.\n\n"
+            f"Закрыть точку без этих фото можно только с подтверждением логиста. Отправить запрос?",
+            reply_markup=ikb([[("📨 Отправить логисту на подтверждение", f"pcx:{p['id']}")],
+                              [("📷 Загрузить фото", f"po:{p['id']}")]]))
         return
     S.close_point(p["id"], uid, "driver")
     await state.clear()
@@ -654,6 +697,44 @@ async def cb_nav(cb: CallbackQuery, bot: Bot):
         return
     await cb.answer("Ищу точку на карте…")
     await geo.send_nav(bot, cb.message.chat.id, p)
+
+
+@router.callback_query(F.data.startswith("pcx:"))
+async def cb_close_request_docs(cb: CallbackQuery, state: FSMContext, bot: Bot):
+    """Закрытие без акта / возвратной накладной — уведомление логисту, он подтверждает."""
+    uid = cb.from_user.id
+    p = own_point(uid, int(cb.data[4:]))
+    if not p or p["status"] == "closed":
+        await cb.answer("Точка недоступна или уже закрыта", show_alert=True)
+        return
+    missing = S.missing_approval(p)
+    if S.next_step(p) or not missing:
+        await cb.answer()
+        await ask_step(cb.message, state, p)
+        return
+    comment = "Нет фото: " + ", ".join(m.lower() for m in missing)
+    if not S.request_point_close(p["id"], uid, comment):
+        await cb.answer("Запрос уже отправлен", show_alert=True)
+        return
+    await state.clear()
+    await cb.answer("Запрос отправлен")
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    r = S.route_with_wb(p["route_id"])
+    await cb.message.answer("⏳ Запрос на закрытие точки отправлен логисту. Пока ждёте решения, можно продолжать маршрут.",
+                            reply_markup=DRIVER_KB)
+    await notify_admins(bot, f"📨 <b>Запрос на закрытие точки без документов</b>\n"
+                             f"👤 {user_label(uid)}\n"
+                             f"🗺 Маршрут №{h(r['route_no'])} · рейс {h(S.route_title(r))}\n"
+                             f"📍 {p['seq']}. {h(p['network'])} — {h(p['address'])}\n\n"
+                             f"{S.photos_progress(p)}\n\n💬 {h(comment)}",
+                        reply_markup=ikb([[("✅ Подтвердить закрытие", f"pqa:{p['id']}")],
+                                          [("❌ Отклонить", f"pqr:{p['id']}")],
+                                          [("🖼 Фото по точке", f"pph:{p['id']}")]]))
+    text_, markup = route_view(p["route_id"])
+    await cb.message.answer(text_, reply_markup=markup)
 
 
 # ------------------------------------------------------------ close point w/o photos
@@ -941,7 +1022,7 @@ async def problem_send(message: Message, state: FSMContext, bot: Bot):
 
 def point_photo_files(p) -> tuple[list, int, int]:
     """Все фото точки: обязательные, дополнительные, к проблемам. -> (файлы, доп., к проблемам)"""
-    files = [(p[f], "photo", None) for f in ("photo_display", "photo_invoice", "photo_poa") if p[f]]
+    files = [(p[f], "photo", None) for _, f, _l in S.PHOTO_SLOTS if p[f]]
     extras = S.extra_photos(p["id"])
     probs = db.q("SELECT * FROM photos WHERE kind='problem' AND point_id=? ORDER BY id", (p["id"],))
     files += [(x["file_id"], x["file_type"], x["file_name"]) for x in extras]
@@ -956,8 +1037,7 @@ async def send_point_photos(bot: Bot, chat_id: int, p, empty_text: bool = True) 
         if empty_text:
             await bot.send_message(chat_id, f"🖼 По точке {p['seq']}. {h(p['address'])} фото пока нет.")
         return False
-    labels = [lbl for f, lbl in (("photo_display", "выкладка"), ("photo_invoice", "накладная"),
-                                 ("photo_poa", "доверенность")) if p[f]]
+    labels = [lbl.lower() for _, f, lbl in S.PHOTO_SLOTS if p[f]]
     cap = (f"🖼 <b>Фото по точке {p['seq']}</b>. {h(p['network'] or '')} — {h(p['address'])}\n"
            f"{'✅ закрыта ' + S.fmt_time(p['closed_at']) if p['status'] == 'closed' else '⬜ не закрыта'}"
            f"{' · доверенность отсутствует' if p['poa_absent'] else ''}"

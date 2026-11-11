@@ -325,10 +325,40 @@ async def cb_admin_photo(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
     await state.set_state(Trip.photo)
     await state.update_data(ap_pid=pid)
-    await cb.message.answer("📷 Отправьте фото для точки. Бот разложит их по порядку: 1) выкладка, "
-                            "2) накладная, 3) доверенность; следующие — дополнительные фото. Можно альбомом.",
-                            reply_markup=ikb([[("🚫 Доверенность отсутствует", f"apn:{pid}")],
-                                              [("✅ Готово", f"apc:{pid}")]]))
+    _aslot.pop(cb.from_user.id, None)
+    await cb.message.answer(admin_photo_text(pid), reply_markup=admin_photo_kb(pid))
+
+
+_aslot: dict[int, tuple[int, str]] = {}
+
+
+def admin_photo_text(pid: int) -> str:
+    p = db.q1("SELECT * FROM points WHERE id=?", (pid,))
+    return (f"📷 <b>Фото точки</b> {p['seq']}. {h(p['address'])}\n\n{S.photos_progress(p)}\n\n"
+            f"Выберите пункт и отправьте фото. Если отправить фото без выбора — бот разложит их по порядку "
+            f"в незаполненные пункты, остальные станут дополнительными.")
+
+
+def admin_photo_kb(pid: int):
+    p = db.q1("SELECT * FROM points WHERE id=?", (pid,))
+    rows = [[(f"{'✅' if p[f] else ('➖' if c == 'poa' and p['poa_absent'] else '📷')} {i}. {l}", f"aps:{pid}:{c}")]
+            for i, (c, f, l) in enumerate(S.PHOTO_SLOTS, 1)]
+    rows.append([("📎 Дополнительное фото", f"aps:{pid}:extra")])
+    if not p["photo_poa"] and not p["poa_absent"]:
+        rows.append([("🚫 Доверенность отсутствует", f"apn:{pid}")])
+    rows.append([("✅ Закрыть точку", f"apx:{pid}"), ("⬅️ Карточка точки", f"apc:{pid}")])
+    return ikb(rows)
+
+
+@router.callback_query(F.data.startswith("aps:"), ADM)
+async def cb_admin_pick_slot(cb: CallbackQuery, state: FSMContext):
+    _, pid, code = cb.data.split(":")
+    await state.set_state(Trip.photo)
+    await state.update_data(ap_pid=int(pid))
+    _aslot[cb.from_user.id] = (int(pid), code)
+    await cb.answer()
+    await cb.message.answer("📎 Отправьте дополнительные фото." if code == "extra"
+                            else f"📸 Отправьте фото: <b>{S.SLOT_LABEL[code]}</b>.")
 
 
 @router.message(Trip.photo, F.photo | F.document, ADM)
@@ -340,22 +370,23 @@ async def admin_got_photo(message: Message, state: FSMContext):
         return
     fid = message.photo[-1].file_id if message.photo else message.document.file_id
     ftype = "photo" if message.photo else "document"
-    step = S.next_step(p)
-    if step and ftype == "photo":
-        field = {"display": "photo_display", "invoice": "photo_invoice", "poa": "photo_poa"}[step]
-        db.x(f"UPDATE points SET {field}=? WHERE id=?", (fid, pid))
+    sel = _aslot.get(message.from_user.id)
+    chosen = sel[1] if sel and sel[0] == pid else None
+    if chosen and chosen != "extra" and ftype == "photo":
+        _aslot.pop(message.from_user.id, None)
+        step = chosen
+    elif chosen == "extra":
+        step = None
+    else:
+        step = S.next_any_slot(p) if ftype == "photo" else None
+    if step:
+        db.x(f"UPDATE points SET {S.SLOT_FIELD[step]}=? WHERE id=?", (fid, pid))
     else:
         S.add_photo("extra", fid, ftype, message.from_user.id, point_id=pid, route_id=p["route_id"],
                     file_name=message.document.file_name if message.document else None)
 
     async def reply():
-        fresh = db.q1("SELECT * FROM points WHERE id=?", (pid,))
-        rows = []
-        if S.next_step(fresh) == "poa":
-            rows.append([("🚫 Доверенность отсутствует", f"apn:{pid}")])
-        rows += [[("✅ Закрыть точку", f"apx:{pid}")], [("⬅️ Карточка точки", f"apc:{pid}")]]
-        await message.answer(f"📷 Фото сохранены.\n\n{S.photos_progress(fresh)}\n\nМожно отправить ещё или:",
-                             reply_markup=ikb(rows))
+        await message.answer(admin_photo_text(pid), reply_markup=admin_photo_kb(pid))
 
     debounce(message.from_user.id, reply)
 
@@ -365,9 +396,7 @@ async def cb_admin_no_poa(cb: CallbackQuery):
     pid = int(cb.data[4:])
     db.x("UPDATE points SET poa_absent=1, photo_poa=NULL WHERE id=?", (pid,))
     await cb.answer("Отмечено: доверенность отсутствует")
-    p = db.q1("SELECT * FROM points WHERE id=?", (pid,))
-    await cb.message.answer(S.photos_progress(p), reply_markup=ikb([[("✅ Закрыть точку", f"apx:{pid}")],
-                                                                    [("⬅️ Карточка точки", f"apc:{pid}")]]))
+    await cb.message.answer(admin_photo_text(pid), reply_markup=admin_photo_kb(pid))
 
 
 async def _finish_close(bot: Bot, message: Message, pid: int, admin_id: int, via: str, note: str | None):
@@ -407,7 +436,9 @@ async def cb_admin_close_point(cb: CallbackQuery, state: FSMContext, bot: Bot):
         return
     if S.photos_complete(p):
         await state.clear()
-        await _finish_close(bot, cb.message, pid, cb.from_user.id, "admin", None)
+        missing = S.missing_approval(p)
+        note = ("Закрыто логистом без фото: " + ", ".join(m.lower() for m in missing)) if missing else None
+        await _finish_close(bot, cb.message, pid, cb.from_user.id, "admin", note)
         return
     await state.set_state(Trip.close_reason)
     await state.update_data(cr_pid=pid)
@@ -551,11 +582,13 @@ async def cb_point_req_approve(cb: CallbackQuery, bot: Bot):
     S.close_point(pid, driver or cb.from_user.id, "approved", p["close_req_comment"])
     r = S.route_with_wb(p["route_id"])
     c, t = S.route_counts(r["id"])
-    await cb.message.answer(f"✅ Точка {p['seq']}. {h(p['address'])} закрыта без фото по запросу водителя. "
+    await cb.message.answer(f"✅ Точка {p['seq']}. {h(p['address'])} закрыта по запросу водителя"
+                            + (f" ({h(p['close_req_comment'])})" if p["close_req_comment"] else "") + ". "
                             f"Маршрут №{h(r['route_no'])}: {c} из {t}.")
     if driver:
         try:
-            await bot.send_message(driver, f"✅ Логист подтвердил закрытие точки {p['seq']}. {h(p['address'])} без фото.",
+            await bot.send_message(driver, f"✅ Логист подтвердил закрытие точки {p['seq']}. {h(p['address'])}"
+                                           + (f" ({h(p['close_req_comment'])})" if p["close_req_comment"] else "") + ".",
                                    reply_markup=ikb([[("🗺 К маршруту", f"r:{r['id']}")]]) if not r["closed_at"] else None)
         except Exception:
             pass

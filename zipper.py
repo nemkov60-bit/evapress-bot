@@ -18,7 +18,8 @@ from config import EXPORT_DIR
 
 # Telegram позволяет боту отправить файл до 50 МБ — берём с запасом
 MAX_PART = 45 * 1024 * 1024
-KINDS = (("photo_display", "выкладка"), ("photo_invoice", "накладная"), ("photo_poa", "доверенность"))
+KINDS = (("photo_display", "выкладка"), ("photo_invoice", "накладная"), ("photo_poa", "доверенность"),
+         ("photo_act", "акт_приёма"), ("photo_return", "возвратная_накладная"))
 
 _lock = asyncio.Lock()
 
@@ -74,7 +75,7 @@ async def build_zip(bot: Bot, wb_id: int,
                     if p[field]:
                         jobs.append((folder, f"{pdir}/{i}_{label}.jpg", p[field]))
                 for n, x in enumerate(S.extra_photos(p["id"]), 1):
-                    jobs.append((folder, f"{pdir}/4_доп_{n}{ext(x)}", x["file_id"]))
+                    jobs.append((folder, f"{pdir}/6_доп_{n}{ext(x)}", x["file_id"]))
                 for n, x in enumerate(db.q("SELECT * FROM photos WHERE kind='problem' AND point_id=? ORDER BY id",
                                            (p["id"],)), 1):
                     jobs.append((folder, f"{pdir}/проблема_{n}{ext(x)}", x["file_id"]))

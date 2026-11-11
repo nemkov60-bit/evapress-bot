@@ -169,6 +169,9 @@ def migrate() -> None:
     );
     """)
     conn.execute("UPDATE instructions SET version_at=COALESCE(updated_at, created_at) WHERE version_at IS NULL")
+    # v14: фото акта приёма товара и возвратной накладной
+    _add_col("points", "photo_act", "photo_act TEXT")
+    _add_col("points", "photo_return", "photo_return TEXT")
     # v13: порядок объезда точек (как в маршрутном листе), по номеру маршрута и адресу
     conn.execute("""CREATE TABLE IF NOT EXISTS route_order(
         route_no TEXT, point_key TEXT, pos INTEGER, set_at TEXT, PRIMARY KEY(route_no, point_key))""")
