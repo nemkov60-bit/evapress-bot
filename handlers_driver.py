@@ -15,9 +15,9 @@ import guide
 import geo
 import notes as N
 import services as S
-from common import ROLE_NAMES, admin_ids, extract_content, notify_admins, role_of, send_content, send_poster, user_label
+from common import ROLE_NAMES, driver_mode, real_role, set_driver_mode, admin_ids, extract_content, notify_admins, role_of, send_content, send_poster, user_label
 from keyboards import (DRIVER_BUTTONS, B_INSTR, B_MY_ROUTE, B_PROBLEM, B_SEND_PROBLEM, B_START, CANCEL, CANCEL_KB,
-                       DRIVER_KB, PROBLEM_KB, ikb, kb_for, short)
+                       DRIVER_KB, DRIVER_CAB_KB, B_EXIT_CAB, ADMIN_KB, PROBLEM_KB, ikb, kb_for, short)
 
 router = Router(name="driver")
 
@@ -100,7 +100,14 @@ CLOSED_TEXT = ("🔒 <b>Бот EVA Press закрытый.</b>\n"
 
 
 def get_driver(uid: int):
+    if driver_mode(uid) and real_role(uid) == "admin":   # администратор в «Кабинете водителя»
+        return db.q1("SELECT * FROM users WHERE tg_id=?", (uid,))
     return db.q1("SELECT * FROM users WHERE tg_id=? AND active=1 AND COALESCE(role,'driver')='driver'", (uid,))
+
+
+def dkb(uid: int):
+    """Меню водителя; администратору в «Кабинете водителя» — с кнопкой выхода."""
+    return DRIVER_CAB_KB if driver_mode(uid) else DRIVER_KB
 
 
 def own_point(uid: int, pid: int):
@@ -190,13 +197,38 @@ async def ask_step(message: Message, state: FSMContext, p):
 
 # ------------------------------------------------------------ start/reg ---
 
+@router.message(F.text == B_EXIT_CAB)
+@router.message(Command("admin"))
+async def exit_driver_cab(message: Message, state: FSMContext):
+    """Выход администратора из «Кабинета водителя»."""
+    uid = message.from_user.id
+    if real_role(uid) != "admin":
+        await message.answer(CLOSED_TEXT if not get_driver(uid) else "Команда доступна только администратору.",
+                             reply_markup=None if not get_driver(uid) else dkb(uid))
+        return
+    set_driver_mode(uid, False)
+    await state.clear()
+    await message.answer("↩️ Вы вернулись в админку.", reply_markup=ADMIN_KB)
+
+
+@router.callback_query(F.data == "dcab_off")
+async def cb_exit_driver_cab(cb: CallbackQuery, state: FSMContext):
+    if real_role(cb.from_user.id) != "admin":
+        await cb.answer("Только для администратора", show_alert=True)
+        return
+    set_driver_mode(cb.from_user.id, False)
+    await state.clear()
+    await cb.answer()
+    await cb.message.answer("↩️ Вы вернулись в админку.", reply_markup=ADMIN_KB)
+
+
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext, command: CommandObject | None = None):
     await state.clear()
     uid = message.from_user.id
     if get_driver(uid):
         await send_poster(message.bot, message.chat.id, "start",
-                          "👋 Здравствуйте, уважаемый водитель! Выберите действие в меню.", reply_markup=DRIVER_KB)
+                          "👋 Здравствуйте, уважаемый водитель! Выберите действие в меню.", reply_markup=dkb(message.from_user.id))
         return
     arg = (command.args or "") if command else ""
     if arg.startswith("inv_"):
@@ -284,7 +316,7 @@ async def not_registered_cb(cb: CallbackQuery):
 async def cancel(message: Message, state: FSMContext):
     _problem_buf.pop(message.from_user.id, None)
     await state.clear()
-    await message.answer("Отменено.", reply_markup=DRIVER_KB)
+    await message.answer("Отменено.", reply_markup=dkb(message.from_user.id))
 
 
 @router.message(F.text == B_START)
@@ -575,7 +607,7 @@ async def after_point_closed(bot: Bot, rid: int) -> bool:
             await send_poster(bot, r["driver_id"], "thanks",
                               f"🏁 Все точки маршрута №{h(r['route_no'])} (рейс {h(S.route_title(r))}) закрыты — "
                               f"маршрут закрыт автоматически.\nЗакрыто точек: {c} из {t}.\n\n"
-                              f"Благодарим за отличную работу!", reply_markup=DRIVER_KB)
+                              f"Благодарим за отличную работу!", reply_markup=dkb(r["driver_id"]))
         except Exception:
             pass
     await notify_admins(bot, f"🏁 Маршрут №{h(r['route_no'])} (рейс {h(S.route_title(r))}) закрыт автоматически: "
@@ -687,11 +719,11 @@ async def point_req_comment(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
     p = own_point(uid, pid)
     if not p or not S.request_point_close(pid, uid, text):
-        await message.answer("Запрос уже отправлен или точка недоступна.", reply_markup=DRIVER_KB)
+        await message.answer("Запрос уже отправлен или точка недоступна.", reply_markup=dkb(message.from_user.id))
         return
     r = S.route_with_wb(p["route_id"])
     await message.answer("⏳ Запрос отправлен логисту. Пока ждёте решения, можно продолжать маршрут.",
-                         reply_markup=DRIVER_KB)
+                         reply_markup=dkb(message.from_user.id))
     await notify_admins(bot, f"📨 <b>Запрос на закрытие точки без фото</b>\n"
                              f"👤 {user_label(uid)}\n"
                              f"🗺 Маршрут №{h(r['route_no'])} · рейс {h(S.route_title(r))}\n"
@@ -726,7 +758,7 @@ async def cb_instr_ack(cb: CallbackQuery):
     left = len(S.instr_unacked(uid))
     if left == 0:
         await cb.message.answer(f"✅ Вы ознакомились со всеми инструкциями. Теперь можно нажать «{B_START}».",
-                                reply_markup=DRIVER_KB)
+                                reply_markup=dkb(cb.from_user.id))
 
 
 @router.callback_query(F.data.startswith("mk:"))
@@ -792,7 +824,7 @@ async def cb_route_close(cb: CallbackQuery, state: FSMContext, bot: Bot):
         pass
     c, t = S.route_counts(rid)
     await cb.message.answer("⏳ Запрос на закрытие рейса отправлен логисту. Как только он подтвердит, "
-                            "вы получите уведомление.", reply_markup=DRIVER_KB)
+                            "вы получите уведомление.", reply_markup=dkb(cb.from_user.id))
     text = (f"🏁 <b>Запрос на закрытие рейса</b>\n"
             f"👤 {user_label(uid)}\n"
             f"🗺 Маршрут №{h(r['route_no'])} ({S.fmt_date(r['work_date'])})\n"
@@ -831,13 +863,13 @@ async def driver_note_text(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
     p = own_point(uid, pid)
     if not p:
-        await message.answer("Точка недоступна.", reply_markup=DRIVER_KB)
+        await message.answer("Точка недоступна.", reply_markup=dkb(message.from_user.id))
         return
     r = S.route_with_wb(p["route_id"])
     nid = N.add("point", h(message.text.strip()), uid, "driver", "pending", point_key_=N.point_key(p),
                 route_no=r["route_no"])
     await message.answer("✅ Заметка отправлена логисту на проверку. После утверждения её увидят другие водители.",
-                         reply_markup=DRIVER_KB)
+                         reply_markup=dkb(message.from_user.id))
     await notify_admins(bot, f"📝 <b>Заметка водителя на утверждение</b>\n"
                              f"👤 {user_label(uid)}\n"
                              f"📍 {h(p['network'])} — {h(p['address'])} (маршрут №{h(r['route_no'])})\n\n"
@@ -922,7 +954,7 @@ async def problem_send(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
     await message.answer("✅ Сообщение отправлено логисту"
                          + (f" (вложений: {len(files)})" if files else "") + ". Ожидайте ответа.",
-                         reply_markup=DRIVER_KB)
+                         reply_markup=dkb(message.from_user.id))
     r = S.route_with_wb(rid) if rid else None
     head = (f"⚠️ <b>Проблема на адресе</b>\n"
             f"👤 {user_label(uid)}\n"
@@ -1041,6 +1073,8 @@ async def instructions(message: Message, state: FSMContext):
             + ("\n\n🆕 — нужно ознакомиться и нажать «✅ Ознакомлен(а)»." if unacked
                else "\n\n✅ Со всеми ознакомлены." if rows else ""))
     btns = [[(guide.TITLES["driver"], "gd:driver")]]
+    if driver_mode(uid):
+        btns.append([(B_EXIT_CAB, "dcab_off")])
     btns += [[(("🆕 " if r["id"] in unacked else "✅ ") + short(r["title"], 56), f"i:{r['id']}")]
              for r in sorted(rows, key=lambda r: r["id"] not in unacked)]
     await message.answer(head, reply_markup=ikb(btns))
@@ -1081,4 +1115,4 @@ async def cb_instruction(cb: CallbackQuery, bot: Bot):
 
 @router.message()
 async def fallback(message: Message):
-    await message.answer("Выберите действие в меню 👇", reply_markup=DRIVER_KB)
+    await message.answer("Выберите действие в меню 👇", reply_markup=dkb(message.from_user.id))

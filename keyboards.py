@@ -26,6 +26,8 @@ A_INVITE = "🎟 Пригласить"
 A_PROBLEM_TEXT = "⚙️ Текст «Проблема»"
 A_NOTES = "📝 Примечания"
 A_BACKUP = "💾 Резервная копия"
+A_DRIVER_CAB = "🚚 Кабинет водителя"
+B_EXIT_CAB = "↩️ Выйти из кабинета водителя"
 
 CANCEL = "❌ Отмена"
 
@@ -42,6 +44,8 @@ def ikb(rows) -> InlineKeyboardMarkup:
 
 
 DRIVER_KB = kb([[B_START], [B_MY_ROUTE, B_PROBLEM], [B_INSTR]])
+# меню водителя для администратора в «Кабинете водителя»
+DRIVER_CAB_KB = kb([[B_START], [B_MY_ROUTE, B_PROBLEM], [B_INSTR], [B_EXIT_CAB]])
 ADMIN_KB = kb([
     [A_UPLOAD, A_ASSIGN],
     [A_STATS, A_REPORT],
@@ -50,6 +54,7 @@ ADMIN_KB = kb([
     [A_INSTR, A_NOTES],
     [A_USERS, A_INVITE],
     [A_PROBLEM_TEXT, A_BACKUP],
+    [A_DRIVER_CAB],
 ])
 CUSTOMER_KB = kb([[A_STATS, A_REPORT], [A_ZIP, A_INSTR]])
 CANCEL_KB = kb([[CANCEL]])
@@ -58,7 +63,7 @@ PROBLEM_KB = kb([[B_SEND_PROBLEM], [CANCEL]])
 DRIVER_BUTTONS = {B_START, B_MY_ROUTE, B_PROBLEM, B_INSTR}
 ADMIN_BUTTONS = {A_UPLOAD, A_ASSIGN, A_STATS, A_REPORT, A_EXPORT, A_CLOSE, A_TRIPS, A_ZIP, A_ZIP_OLD, A_MSG,
                  A_INSTR, A_INSTR_ADD, "📖 Инструкции водителям", A_USERS, A_INVITE, A_PROBLEM_TEXT, A_NOTES,
-                 A_BACKUP}
+                 A_BACKUP, A_DRIVER_CAB}
 
 
 def kb_for(role: str | None) -> ReplyKeyboardMarkup:

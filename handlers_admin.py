@@ -18,9 +18,9 @@ import geo
 import notes as N
 import services as S
 import zipper
-from common import ROLE_NAMES, extract_content, is_admin, is_staff, role_of, send_content, send_poster, user_label
+from common import ROLE_NAMES, driver_mode, real_role, set_driver_mode, extract_content, is_admin, is_staff, role_of, send_content, send_poster, user_label
 from config import ADMIN_IDS, WB_DIR
-from keyboards import (A_ASSIGN, A_BACKUP, A_CLOSE, A_NOTES, A_EXPORT, A_INSTR, A_INSTR_ADD, A_INVITE, A_MSG, A_PROBLEM_TEXT,
+from keyboards import (A_DRIVER_CAB, DRIVER_CAB_KB, A_ASSIGN, A_BACKUP, A_CLOSE, A_NOTES, A_EXPORT, A_INSTR, A_INSTR_ADD, A_INVITE, A_MSG, A_PROBLEM_TEXT,
                        A_REPORT, A_STATS, A_UPLOAD, A_USERS, A_ZIP, ADMIN_BUTTONS, ADMIN_KB, CANCEL, CANCEL_KB,
                        ikb, kb_for, short)
 
@@ -28,14 +28,26 @@ NOT_MENU = ~F.text.in_(ADMIN_BUTTONS | {CANCEL})
 
 
 class IsStaff(BaseFilter):
-    """Администратор или заказчик — все, кто попадает в этот роутер."""
+    """Администратор или заказчик — все, кто попадает в этот роутер.
+    Сообщения администратора в «Кабинете водителя» уходят в сценарии водителя; нажатия кнопок
+    (подтверждения, ответы и т.п.) по-прежнему обрабатываются как админские."""
     async def __call__(self, event) -> bool:
+        if isinstance(event, CallbackQuery):
+            return real_role(event.from_user.id) in ("admin", "customer")
         return is_staff(event.from_user.id)
 
 
 class IsAdmin(BaseFilter):
     async def __call__(self, event) -> bool:
+        if isinstance(event, CallbackQuery):
+            return real_role(event.from_user.id) == "admin"
         return is_admin(event.from_user.id)
+
+
+class NotInDriverMode(BaseFilter):
+    """Для кнопок, которые есть и у водителя: в «Кабинете водителя» их обрабатывают сценарии водителя."""
+    async def __call__(self, event) -> bool:
+        return not driver_mode(event.from_user.id)
 
 
 ADM = IsAdmin()   # фильтр для действий, доступных только администратору
@@ -288,6 +300,8 @@ async def cb_assign_route(cb: CallbackQuery):
         extra = f" [№{busy[d['tg_id']]}]" if d["tg_id"] in busy and d["tg_id"] != r["driver_id"] else ""
         off = "📵 " if d["offline"] else ""
         rows.append([(f"{mark}{off}{short(d['full_name'], 40)}{extra}", f"ad:{rid}:{d['tg_id']}")])
+    me = cb.from_user.id
+    rows.append([(("✔️ " if r["driver_id"] == me else "") + "👑 Я — тест в «Кабинете водителя»", f"ad:{rid}:{me}")])
     rows.append([("🚫 Снять назначение", f"ad:{rid}:0")])
     rows.append([("⬅️ Назад", f"wd:as:{r['workbook_id']}")])
     await cb.answer()
@@ -1414,6 +1428,40 @@ async def cb_note_decide(cb: CallbackQuery, bot: Bot):
         pass
 
 
+# ------------------------------------------------------------ кабинет водителя
+
+@router.message(F.text == A_DRIVER_CAB, ADM)
+async def driver_cab_menu(message: Message, state: FSMContext):
+    await state.clear()
+    uid = message.from_user.id
+    n = db.q1("SELECT COUNT(*) c FROM routes r JOIN workbooks w ON w.id=r.workbook_id "
+              "WHERE r.driver_id=? AND w.closed_at IS NULL AND r.closed_at IS NULL", (uid,))["c"]
+    await message.answer(
+        "🚚 <b>Кабинет водителя</b> — бот покажет вам всё так, как видит водитель: меню водителя, «Начать маршрут», "
+        "закрытие точек, фото, «Проблема на адресе», инструкции.\n\n"
+        f"Маршрутов, назначенных на вас: <b>{n}</b>. Назначить себе маршрут: «🧭 Назначить маршруты» → маршрут → "
+        "«👑 Я — тест в «Кабинете водителя»».\n\n"
+        "⚠️ Всё, что вы сделаете, — настоящие данные: закрытые точки и фото попадут в отчёты и Excel. "
+        "Для проверки лучше использовать тестовый рейс или потом открыть точки снова («🗂 Рейсы»).\n\n"
+        "Выход — кнопка «↩️ Выйти из кабинета водителя» или команда /admin. Кнопки в уведомлениях "
+        "(подтверждения, ответы водителям) работают и в кабинете водителя.",
+        reply_markup=ikb([[("▶️ Войти в кабинет водителя", "dcab_on")]]))
+
+
+@router.callback_query(F.data == "dcab_on", ADM)
+async def cb_driver_cab_on(cb: CallbackQuery, state: FSMContext):
+    uid = cb.from_user.id
+    await state.clear()
+    # строка пользователя нужна сценариям водителя (имя в отчётах); роль администратора не меняется
+    db.x("INSERT INTO users(tg_id, full_name, username, role, created_at) VALUES(?,?,?,'admin',?) "
+         "ON CONFLICT(tg_id) DO UPDATE SET active=1",
+         (uid, f"{cb.from_user.full_name} (админ)", cb.from_user.username, db.now_s()))
+    set_driver_mode(uid, True)
+    await cb.answer("Вы в кабинете водителя")
+    await cb.message.answer("🚚 <b>Вы в кабинете водителя.</b> Меню ниже — как у водителя.\n"
+                            "Выход — «↩️ Выйти из кабинета водителя» или /admin.", reply_markup=DRIVER_CAB_KB)
+
+
 # ------------------------------------------------------------ backup ------
 
 @router.message(Command("backup"), ADM)
@@ -1567,7 +1615,7 @@ async def cb_backup_channel(cb: CallbackQuery, bot: Bot):
                             f"тогда канал не «забудется», даже если хостинг сотрёт данные бота.")
 
 
-@router.callback_query()
+@router.callback_query(NotInDriverMode())
 async def staff_cb_fallback(cb: CallbackQuery):
     await cb.answer("Недостаточно прав", show_alert=True)
 

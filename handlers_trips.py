@@ -17,7 +17,7 @@ import geo
 import notes as N
 import services as S
 from common import is_admin, send_poster, user_label
-from handlers_admin import ADM, IsStaff, NOT_MENU, safe_edit, zip_send
+from handlers_admin import ADM, IsStaff, NOT_MENU, NotInDriverMode, safe_edit, zip_send
 from keyboards import A_CLOSE, A_TRIPS, A_ZIP, A_ZIP_OLD, ADMIN_KB, CANCEL_KB, ikb, short
 
 router = Router(name="trips")
@@ -228,7 +228,7 @@ async def cb_route_close(cb: CallbackQuery, bot: Bot):
 
 # ------------------------------------------------------------ порядок точек (админ)
 
-@router.callback_query(F.data.startswith(("ord:", "orp:", "oru:", "ork:", "orr:")), ADM)
+@router.callback_query(F.data.startswith(("ord:", "orp:", "oru:", "ork:", "orr:")), ADM, NotInDriverMode())
 async def cb_admin_order(cb: CallbackQuery):
     kind, rest = cb.data.split(":", 1)
     rid = int(rest.split(":")[0])
@@ -442,7 +442,7 @@ async def cb_admin_reopen_point(cb: CallbackQuery):
                             + text, reply_markup=markup)
 
 
-@router.callback_query(F.data.startswith("nav:"), ADM)
+@router.callback_query(F.data.startswith("nav:"), ADM, NotInDriverMode())
 async def cb_admin_nav(cb: CallbackQuery, bot: Bot):
     p = db.q1("SELECT * FROM points WHERE id=?", (int(cb.data[4:]),))
     await cb.answer("Ищу точку на карте…")

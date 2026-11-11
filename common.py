@@ -33,12 +33,28 @@ async def send_poster(bot: Bot, chat_id: int, key: str, caption: str, reply_mark
 ROLE_NAMES = {"admin": "Администратор", "customer": "Заказчик", "driver": "Водитель"}
 
 
-def role_of(uid: int) -> str | None:
-    """admin / customer / driver или None (нет доступа)."""
+def driver_mode(uid: int) -> bool:
+    """Администратор сейчас в «Кабинете водителя» (тестирует функции водителя)."""
+    return db.get_setting(f"driver_mode:{uid}") == "1"
+
+
+def set_driver_mode(uid: int, on: bool) -> None:
+    db.set_setting(f"driver_mode:{uid}", "1" if on else "0")
+
+
+def real_role(uid: int) -> str | None:
     if uid in ADMIN_IDS:
         return "admin"
     u = db.q1("SELECT role FROM users WHERE tg_id=? AND active=1", (uid,))
     return (u["role"] or "driver") if u else None
+
+
+def role_of(uid: int) -> str | None:
+    """admin / customer / driver или None (нет доступа). Администратор в «Кабинете водителя» — driver."""
+    role = real_role(uid)
+    if role == "admin" and driver_mode(uid):
+        return "driver"
+    return role
 
 
 def is_admin(uid: int) -> bool:
