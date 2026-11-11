@@ -183,6 +183,19 @@ def migrate() -> None:
                     SELECT 'problem', point_id, route_id, id, driver_id, file_id, file_type, created_at
                     FROM problems WHERE file_id IS NOT NULL""")
     conn.execute("UPDATE problems SET file_id=NULL WHERE file_id IS NOT NULL")
+    # фото акта приёма товара и возвратной накладной, загруженные в версии 14 (11.11.2026), — сохраняем:
+    # переносим в дополнительные фото точки (их показывают «Фото по точке», отчёты и ZIP). Исходные поля
+    # не трогаем; повторный запуск ничего не дублирует.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(points)")}
+    for col, name in (("photo_act", "акт_приёма_товара.jpg"), ("photo_return", "возвратная_накладная.jpg")):
+        if col in cols:
+            conn.execute(f"""INSERT INTO photos(kind, point_id, route_id, driver_id, file_id, file_type, file_name,
+                                                created_at)
+                             SELECT 'extra', p.id, p.route_id, COALESCE(p.closed_by, r.driver_id), p.{col}, 'photo',
+                                    ?, COALESCE(p.closed_at, datetime('now'))
+                             FROM points p JOIN routes r ON r.id = p.route_id
+                             WHERE p.{col} IS NOT NULL AND NOT EXISTS (
+                                 SELECT 1 FROM photos x WHERE x.point_id = p.id AND x.file_id = p.{col})""", (name,))
     conn.commit()
 
 
