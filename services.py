@@ -260,9 +260,8 @@ def import_workbook(path: Path, filename: str, work_date: date, admin_id: int) -
                            vals + (old["status"], old["opened_at"], old["closed_at"], old["closed_by"],
                                    old["photo_display"], old["photo_invoice"], old["photo_poa"], old["poa_absent"]))
                 db.x("UPDATE points SET close_req_at=?, close_req_by=?, close_req_comment=?, close_note=?, "
-                     "closed_via=?, photo_act=?, photo_return=? WHERE id=?",
-                     (old["close_req_at"], old["close_req_by"], old["close_req_comment"], old["close_note"],
-                      old["closed_via"], old["photo_act"], old["photo_return"], pid))
+                     "closed_via=? WHERE id=?", (old["close_req_at"], old["close_req_by"], old["close_req_comment"],
+                                                 old["close_note"], old["closed_via"], pid))
                 id_map[old["id"]] = (pid, rid)
                 kept_closed += old["status"] == "closed"
             else:
@@ -496,46 +495,16 @@ def point_text(p, route=None) -> str:
     return "\n".join(lines)
 
 
-# Слоты фото точки: (код, поле, название). Первые три — обязательные (доверенность можно отметить «отсутствует»);
-# акт и возвратная накладная — без них точку можно закрыть только с подтверждением логиста.
-PHOTO_SLOTS = [
-    ("display", "photo_display", "Выкладка продукции"),
-    ("invoice", "photo_invoice", "Накладная с печатью и подписью"),
-    ("poa", "photo_poa", "Доверенность на возврат"),
-    ("act", "photo_act", "Акт приёма товара"),
-    ("ret", "photo_return", "Возвратная накладная"),
-]
-SLOT_FIELD = {c: f for c, f, _ in PHOTO_SLOTS}
-SLOT_LABEL = {c: l for c, _, l in PHOTO_SLOTS}
-APPROVAL_SLOTS = ("act", "ret")
-
-
 def photos_progress(p) -> str:
-    lines = []
-    for i, (code, field, label) in enumerate(PHOTO_SLOTS, 1):
-        if code == "poa" and not p[field] and p["poa_absent"]:
-            lines.append(f"➖ {i}. Доверенность отсутствует")
-        else:
-            lines.append(f"{'✅' if p[field] else '▫️'} {i}. {label}")
+    def mark(ok):
+        return "✅" if ok else "▫️"
+    poa = "✅ Фото доверенности на возврат" if p["photo_poa"] else (
+        "➖ Доверенность отсутствует" if p["poa_absent"] else "▫️ Фото доверенности на возврат")
     n_extra = len(extra_photos(p["id"]))
-    if n_extra:
-        lines.append(f"📎 Дополнительные фото: {n_extra}")
-    return "\n".join(lines)
-
-
-def missing_approval(p) -> list[str]:
-    """Названия фото, без которых закрытие точки требует подтверждения логиста."""
-    return [SLOT_LABEL[c] for c in APPROVAL_SLOTS if not p[SLOT_FIELD[c]]]
-
-
-def next_any_slot(p) -> str | None:
-    """Первый незаполненный слот (для последовательной загрузки администратором)."""
-    for code, field, _ in PHOTO_SLOTS:
-        if code == "poa" and p["poa_absent"]:
-            continue
-        if not p[field]:
-            return code
-    return None
+    return (f"{mark(p['photo_display'])} Фото выкладки\n"
+            f"{mark(p['photo_invoice'])} Фото накладной\n"
+            f"{poa}"
+            + (f"\n📎 Дополнительные фото: {n_extra}" if n_extra else ""))
 
 
 def next_step(p) -> str | None:
