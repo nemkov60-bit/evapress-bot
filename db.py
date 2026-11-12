@@ -178,6 +178,12 @@ def migrate() -> None:
     # v10: точные координаты адреса для кнопки «Маршрут до точки» (общие для всех дат, как заметки)
     conn.execute("""CREATE TABLE IF NOT EXISTS point_geo(
         point_key TEXT PRIMARY KEY, lat REAL, lon REAL, set_by INTEGER, set_at TEXT)""")
+    # ответы водителям на «Проблему на адресе» (могут отвечать администраторы и заказчики)
+    for col in ("answered_by INTEGER", "answered_name TEXT", "answered_at TEXT", "answer_text TEXT",
+                "answer_chat_id INTEGER", "answer_msg_id INTEGER"):
+        _add_col("problems", col.split()[0], col)
+    conn.execute("""CREATE TABLE IF NOT EXISTS problem_notices(
+        problem_id INTEGER, chat_id INTEGER, message_id INTEGER, PRIMARY KEY(problem_id, chat_id, message_id))""")
     # перенос единственного фото из старых записей problems в photos
     conn.execute("""INSERT INTO photos(kind, point_id, route_id, problem_id, driver_id, file_id, file_type, created_at)
                     SELECT 'problem', point_id, route_id, id, driver_id, file_id, file_type, created_at

@@ -626,3 +626,18 @@ def zip_archive(wb_id: int) -> list:
 def archived_workbooks() -> list:
     return db.q("SELECT w.*, MAX(z.created_at) zip_at FROM workbooks w JOIN zip_archives z ON z.workbook_id=w.id "
                 "GROUP BY w.id ORDER BY w.work_date DESC")
+
+
+# ---------------------------------------------------------- ответы на проблемы ----
+
+def problem_recipients() -> list[int]:
+    """Кому приходит «Проблема на адресе»: администраторы и заказчики (с Telegram)."""
+    from config import ADMIN_IDS
+    ids = set(ADMIN_IDS) | {r["tg_id"] for r in db.q("SELECT tg_id FROM users WHERE role IN ('admin','customer') "
+                                                      "AND active=1 AND tg_id > 0")}
+    return sorted(ids)
+
+
+def problem_answer_markup(prob_id: int):
+    from keyboards import ikb
+    return ikb([[("✅ Ответ отправлен — посмотреть", f"ansv:{prob_id}")]])

@@ -62,6 +62,7 @@ class Adm(StatesGroup):
     instr_title = State()
     instr_body = State()
     msg = State()
+    answer = State()
     problem_text = State()
     reject_reason = State()
     note_text = State()
@@ -807,7 +808,112 @@ async def msg_menu(message: Message, state: FSMContext):
     await message.answer("✉️ Кому отправить инструкцию / сообщение?", reply_markup=ikb(rows))
 
 
-@router.callback_query(F.data.startswith("mt:") | F.data.startswith("ans:"), ADM)
+# ---------------------------------------- ответ водителю на «Проблему на адресе» (админ и заказчик) ----
+
+def _problem_place(prob) -> str:
+    p = db.q1("SELECT * FROM points WHERE id=?", (prob["point_id"],)) if prob and prob["point_id"] else None
+    return f"{p['seq']}. {p['network']} — {p['address']}" if p else ""
+
+
+def _answerer_name(user) -> str:
+    u = db.q1("SELECT full_name FROM users WHERE tg_id=?", (user.id,))
+    role = ROLE_NAMES.get(real_role(user.id) or "", "")
+    return (u["full_name"] if u and u["full_name"] else user.full_name) + (f" ({role.lower()})" if role else "")
+
+
+@router.callback_query(F.data.startswith("ans:"))
+async def cb_answer_problem(cb: CallbackQuery, state: FSMContext):
+    parts = cb.data.split(":")
+    uid = int(parts[1])
+    pid = int(parts[2]) if len(parts) > 2 else None
+    prob = db.q1("SELECT * FROM problems WHERE id=?", (pid,)) if pid else None
+    if prob and prob["answered_at"]:
+        await cb.answer("Водителю уже ответили", show_alert=True)
+        try:
+            await cb.message.edit_reply_markup(reply_markup=S.problem_answer_markup(pid))
+        except Exception:
+            pass
+        await send_problem_answer(cb.message, prob)
+        return
+    await state.set_state(Adm.answer)
+    await state.update_data(answer_uid=uid, answer_pid=pid)
+    await cb.answer()
+    place = _problem_place(prob)
+    await cb.message.answer(f"✉️ Ответ водителю <b>{h(S.driver_name(uid))}</b>"
+                            + (f"\n📍 {h(place)}" if place else "")
+                            + "\n\nОтправьте ответ (текст, фото, видео, документ, голосовое):",
+                            reply_markup=CANCEL_KB)
+
+
+@router.message(Adm.answer, NOT_MENU)
+async def answer_send(message: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    await state.clear()
+    uid, pid = data["answer_uid"], data.get("answer_pid")
+    prob = db.q1("SELECT * FROM problems WHERE id=?", (pid,)) if pid else None
+    place = _problem_place(prob)
+    head = "📨 <b>Ответ на ваше сообщение о проблеме</b>" + (f"\n📍 {h(place)}" if place else "")
+    body = message.text or message.caption or "(медиа)"
+    mid = S.msg_register(message.from_user.id, "message", S.driver_name(uid), body, message.chat.id)
+    try:
+        if message.text:
+            await bot.send_message(uid, f"{head}\n\n{message.html_text}\n\n<i>Подтвердите получение кнопкой ниже.</i>",
+                                   reply_markup=acks.ack_markup(mid))
+        else:
+            await bot.send_message(uid, f"{head}\n<i>Подтвердите получение кнопкой под ответом.</i>")
+            await bot.copy_message(uid, message.chat.id, message.message_id, reply_markup=acks.ack_markup(mid))
+        S.msg_delivered(mid, uid)
+    except Exception:
+        await message.answer("❌ Не удалось доставить ответ: водитель не запускал бота или заблокировал его.",
+                             reply_markup=my_kb(message.from_user.id))
+        return
+    if prob:
+        db.x("UPDATE problems SET answered_by=?, answered_name=?, answered_at=?, answer_text=?, answer_chat_id=?, "
+             "answer_msg_id=? WHERE id=?",
+             (message.from_user.id, _answerer_name(message.from_user), db.now_s(),
+              message.html_text if (message.text or message.caption) else "",
+              None if message.text else message.chat.id,          # вложение — покажем копией сообщения
+              None if message.text else message.message_id, pid))
+        for n in db.q("SELECT * FROM problem_notices WHERE problem_id=?", (pid,)):
+            try:
+                await bot.edit_message_reply_markup(chat_id=n["chat_id"], message_id=n["message_id"],
+                                                    reply_markup=S.problem_answer_markup(pid))
+            except Exception:
+                pass
+    await message.answer("✅ Ответ отправлен водителю. Подтверждение получения — ниже.",
+                         reply_markup=my_kb(message.from_user.id))
+    await acks.post_summary(bot, mid)
+
+
+async def send_problem_answer(target: Message, prob) -> None:
+    """Показывает отправленный водителю ответ (кто, когда, текст или вложение)."""
+    head = (f"✅ <b>Ответ водителю {h(S.driver_name(prob['driver_id']))}</b>\n"
+            f"👤 Ответил: {h(prob['answered_name'] or S.driver_name(prob['answered_by']))}\n"
+            f"🕒 {S.fmt_time(prob['answered_at'])}")
+    place = _problem_place(prob)
+    if place:
+        head += f"\n📍 {h(place)}"
+    if prob["answer_text"]:
+        head += f"\n\n{prob['answer_text']}"
+    await target.answer(head[:4000])
+    if prob["answer_chat_id"] and prob["answer_msg_id"]:
+        try:
+            await target.bot.copy_message(target.chat.id, prob["answer_chat_id"], prob["answer_msg_id"])
+        except Exception:
+            await target.answer("📎 Ответ содержал вложение — оно доступно в чате того, кто отвечал.")
+
+
+@router.callback_query(F.data.startswith("ansv:"))
+async def cb_view_problem_answer(cb: CallbackQuery):
+    prob = db.q1("SELECT * FROM problems WHERE id=?", (int(cb.data[5:]),))
+    if not prob or not prob["answered_at"]:
+        await cb.answer("Ответ не найден", show_alert=True)
+        return
+    await cb.answer()
+    await send_problem_answer(cb.message, prob)
+
+
+@router.callback_query(F.data.startswith("mt:"), ADM)
 async def cb_msg_target(cb: CallbackQuery, state: FSMContext):
     target = cb.data.split(":", 1)[1]
     if target == "active":

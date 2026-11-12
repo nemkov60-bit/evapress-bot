@@ -7,7 +7,7 @@ from datetime import datetime
 
 from config import BASE_DIR, TZ
 
-RELEASE = "12.11.2026 — команда /version; «🖼 Загруженные фото» в запросе на закрытие точки"
+RELEASE = "12.11.2026 — ответы водителям на «Проблему на адресе» для заказчиков; «Ответ отправлен — посмотреть»"
 STARTED = datetime.now(TZ)
 
 

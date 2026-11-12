@@ -972,13 +972,19 @@ async def problem_send(message: Message, state: FSMContext, bot: Bot):
             + (f"📍 {p['seq']}. {h(p['network'])} — {h(p['address'])}\n" if p else "📍 без привязки к адресу\n")
             + (f"📷 Вложений: {len(files)}\n" if files else "")
             + f"\n{h(text) if text else '(без текста)'}")
-    await notify_admins(bot, head, reply_markup=ikb([[("✉️ Ответить водителю", f"ans:{uid}")]]))
-    if files:
-        for aid in admin_ids():
-            try:
-                await send_files(bot, aid, files)
-            except Exception:
-                pass
+    # администраторам и заказчикам; запоминаем сообщения, чтобы после ответа заменить кнопку на «Ответ отправлен»
+    markup = ikb([[("✉️ Ответить водителю", f"ans:{uid}:{prob_id}")]])
+    for sid in S.problem_recipients():
+        try:
+            for i in range(0, len(head), 4000):
+                last = i + 4000 >= len(head)
+                m = await bot.send_message(sid, head[i:i + 4000], reply_markup=markup if last else None)
+            db.x("INSERT OR IGNORE INTO problem_notices(problem_id, chat_id, message_id) VALUES(?,?,?)",
+                 (prob_id, sid, m.message_id))
+            if files:
+                await send_files(bot, sid, files)
+        except Exception:
+            pass
 
 
 def point_photo_files(p) -> tuple[list, int, int]:
