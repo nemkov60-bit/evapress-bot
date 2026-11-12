@@ -20,6 +20,8 @@ async def main():
     if not ADMIN_IDS:
         logging.warning("ADMIN_IDS не заданы — админ-функции недоступны. Узнайте свой ID командой /myid.")
     logging.info("Данные бота хранятся в %s", DATA_DIR)
+    import version
+    logging.info("Версия: %s", version.text().replace("\n", " | "))
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(handlers_trips.router)   # рейсы/точки/ZIP — до общего роутера админа с его «заглушками»

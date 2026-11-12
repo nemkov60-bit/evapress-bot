@@ -145,6 +145,12 @@ async def cmd_myid(message: Message):
                          f"({ROLE_NAMES[role_of(message.from_user.id)].lower()})")
 
 
+@router.message(Command("version"))
+async def cmd_version(message: Message):
+    import version
+    await message.answer(version.text())
+
+
 @router.message(Command("help"))
 async def cmd_help(message: Message):
     uid = message.from_user.id

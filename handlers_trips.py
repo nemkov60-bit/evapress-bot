@@ -534,6 +534,28 @@ async def cb_trip_delete(cb: CallbackQuery, bot: Bot):
 
 # ------------------------------------------------------------ запросы водителя на закрытие без фото
 
+@router.callback_query(F.data.startswith("pqv:"), ADM)
+async def cb_point_req_photos(cb: CallbackQuery, bot: Bot):
+    """Запрос водителя на закрытие без фото: показать уже загруженные фото, затем кнопки решения."""
+    from handlers_driver import send_point_photos
+    pid = int(cb.data[4:])
+    p = db.q1("SELECT * FROM points WHERE id=?", (pid,))
+    await cb.answer()
+    if not p:
+        await cb.message.answer("Точка не найдена.")
+        return
+    await send_point_photos(bot, cb.message.chat.id, p)
+    if p["status"] == "closed":
+        await cb.message.answer("ℹ️ Точка уже закрыта — запрос обработан.")
+    elif p["close_req_at"]:
+        await cb.message.answer(f"Решение по запросу — точка {p['seq']}. {h(p['address'])}\n"
+                                f"💬 Причина: {h(p['close_req_comment'] or '—')}",
+                                reply_markup=ikb([[("✅ Подтвердить закрытие", f"pqa:{pid}")],
+                                                  [("❌ Отклонить", f"pqr:{pid}")]]))
+    else:
+        await cb.message.answer("ℹ️ Запрос уже отклонён — точка открыта.")
+
+
 @router.callback_query(F.data.startswith("pqa:"), ADM)
 async def cb_point_req_approve(cb: CallbackQuery, bot: Bot):
     pid = int(cb.data[4:])

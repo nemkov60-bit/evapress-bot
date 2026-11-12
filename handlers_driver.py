@@ -197,6 +197,15 @@ async def ask_step(message: Message, state: FSMContext, p):
 
 # ------------------------------------------------------------ start/reg ---
 
+@router.message(Command("version"))
+async def cmd_version_driver(message: Message):
+    if not get_driver(message.from_user.id):
+        await message.answer(CLOSED_TEXT)
+        return
+    import version
+    await message.answer(version.text())
+
+
 @router.message(F.text == B_EXIT_CAB)
 @router.message(Command("admin"))
 async def exit_driver_cab(message: Message, state: FSMContext):
@@ -729,7 +738,8 @@ async def point_req_comment(message: Message, state: FSMContext, bot: Bot):
                              f"🗺 Маршрут №{h(r['route_no'])} · рейс {h(S.route_title(r))}\n"
                              f"📍 {p['seq']}. {h(p['network'])} — {h(p['address'])}\n\n"
                              f"{S.photos_progress(p)}\n\n💬 Причина: {h(text)}",
-                        reply_markup=ikb([[("✅ Подтвердить закрытие", f"pqa:{pid}")],
+                        reply_markup=ikb([[("🖼 Загруженные фото", f"pqv:{pid}")],
+                                          [("✅ Подтвердить закрытие", f"pqa:{pid}")],
                                           [("❌ Отклонить", f"pqr:{pid}")]]))
     text_, markup = route_view(p["route_id"])
     await message.answer(text_, reply_markup=markup)
